@@ -1,0 +1,14 @@
+.DS_Store
+.deps/
+
+# Local market data and credentials are intentionally not versioned.
+data/
+data:ifind_refresh_token/
+
+# Research outputs can be regenerated from scripts and local data.
+research/
+
+# Runtime/cache artifacts.
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
