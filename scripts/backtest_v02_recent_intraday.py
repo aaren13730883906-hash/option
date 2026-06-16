@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backtest the v0.4 588000 ETF option intraday framework on recent data.
+"""Backtest the v0.5 588000 ETF option intraday framework on recent data.
 
 This is a first-pass research backtest:
   - ETF trend signal comes from local 5m ETF data resampled to 15m.
@@ -30,6 +30,7 @@ RESEARCH_DIR = ROOT / "research"
 INTRADAY_CACHE = DATA_DIR / "intraday_cache"
 DAILY_CSV = DATA_DIR / "kcb_option_daily.csv"
 MARKET_IV_CSV = DATA_DIR / "kcb_market_iv_daily.csv"
+ETF_DAILY_CSV = DATA_DIR / "etf_daily_588000_588080.csv"
 TOKEN_RTF = ROOT / "data:ifind_refresh_token" / "refresh- token.rtf"
 DEFAULT_SQLITE = Path("/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite")
 
@@ -52,11 +53,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def position_pct_for_signal(iv_rank: float, etf_volume_ratio: float) -> tuple[float, str]:
-    """Return premium allocation and signal label for v0.4 sizing."""
+    """Return premium allocation and signal label for v0.5 sizing."""
     strong = etf_volume_ratio >= 2.0
     if iv_rank >= 0.35:
         return (0.10, "strong_reduced") if strong else (0.07, "reduced")
     return (0.15, "strong") if strong else (0.10, "normal")
+
+
+def load_daily_direction(underlying: str) -> pd.DataFrame:
+    """Use the previous completed daily bar to decide the tradable direction."""
+    df = pd.read_csv(ETF_DAILY_CSV, dtype={"underlying_code": str})
+    df = df[df["underlying_code"] == underlying].copy()
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df = df.sort_values("trade_date")
+    df["ma20"] = df["etf_close"].rolling(20).mean()
+    df["ma20_slope"] = df["ma20"].diff()
+    prev = df[["trade_date", "etf_close", "ma20", "ma20_slope"]].shift(1)
+    out = df[["trade_date"]].copy()
+    out["trade_date"] = out["trade_date"].dt.strftime("%Y-%m-%d")
+    out["daily_ref_date"] = prev["trade_date"].dt.strftime("%Y-%m-%d")
+    out["daily_ref_close"] = prev["etf_close"]
+    out["daily_ref_ma20"] = prev["ma20"]
+    out["daily_ref_ma20_slope"] = prev["ma20_slope"]
+    out["daily_direction"] = "none"
+    bullish = out["daily_ref_close"].gt(out["daily_ref_ma20"]) & out["daily_ref_ma20_slope"].gt(0)
+    bearish = out["daily_ref_close"].lt(out["daily_ref_ma20"]) & out["daily_ref_ma20_slope"].lt(0)
+    out.loc[bullish, "daily_direction"] = "call"
+    out.loc[bearish, "daily_direction"] = "put"
+    return out
 
 
 def ensure_dirs() -> None:
@@ -324,6 +348,7 @@ def main() -> None:
     daily = daily[(daily["trade_date"] >= start.strftime("%Y-%m-%d")) & (daily["trade_date"] <= end.strftime("%Y-%m-%d"))]
     daily = daily[daily["underlying_code"].isin(underlyings)].copy()
     market_iv = market_iv[(market_iv["trade_date"] >= start.strftime("%Y-%m-%d")) & (market_iv["trade_date"] <= end.strftime("%Y-%m-%d"))]
+    daily_direction = load_daily_direction(args.underlying)
     etf15 = load_etf_15m(args.sqlite, underlyings, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
     token = None if args.no_fetch else get_access_token()
     headers = {"Content-Type": "application/json", "access_token": token} if token else {}
@@ -344,6 +369,12 @@ def main() -> None:
         iv_rank = float(iv_row.iloc[0]["iv_rank_252"])
         if iv < 0.20 or iv_rank >= 0.50:
             continue
+        daily_dir_row = daily_direction[daily_direction["trade_date"] == trade_date]
+        if daily_dir_row.empty:
+            continue
+        daily_dir = str(daily_dir_row.iloc[0]["daily_direction"])
+        if daily_dir not in {"call", "put"}:
+            continue
 
         for bar in day_bars.itertuples(index=False):
             if entries >= 2:
@@ -354,6 +385,8 @@ def main() -> None:
             put_signal = bar.close < bar.prev3_low and bar.ema5 < bar.ema20 and bar.ema20_slope < 0 and vol_ok
             direction = "call" if call_signal else "put" if put_signal else None
             if direction is None:
+                continue
+            if direction != daily_dir:
                 continue
             if day_direction is not None and direction != day_direction:
                 continue
@@ -429,6 +462,11 @@ def main() -> None:
                     "etf_volume_ratio": etf_volume_ratio,
                     "signal_strength": signal_strength,
                     "position_pct": position_pct,
+                    "daily_direction": daily_dir,
+                    "daily_ref_date": daily_dir_row.iloc[0]["daily_ref_date"],
+                    "daily_ref_close": float(daily_dir_row.iloc[0]["daily_ref_close"]),
+                    "daily_ref_ma20": float(daily_dir_row.iloc[0]["daily_ref_ma20"]),
+                    "daily_ref_ma20_slope": float(daily_dir_row.iloc[0]["daily_ref_ma20_slope"]),
                     **chosen,
                     **exit_info,
                 }
@@ -437,8 +475,8 @@ def main() -> None:
             entries_by_direction[direction] += 1
 
     trades_df = pd.DataFrame(trades)
-    trades_path = RESEARCH_DIR / "backtest_v04_588000_recent1m_trades.csv"
-    summary_path = RESEARCH_DIR / "backtest_v04_588000_recent1m_summary.csv"
+    trades_path = RESEARCH_DIR / "backtest_v05_588000_recent1m_trades.csv"
+    summary_path = RESEARCH_DIR / "backtest_v05_588000_recent1m_summary.csv"
     trades_df.to_csv(trades_path, index=False)
     if trades_df.empty:
         summary = pd.DataFrame([{"trades": 0, "start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}])

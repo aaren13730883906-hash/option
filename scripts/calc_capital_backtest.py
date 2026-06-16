@@ -15,9 +15,9 @@ RESEARCH_DIR = ROOT / "research"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trades", type=Path, default=RESEARCH_DIR / "backtest_v04_588000_recent1m_trades.csv")
-    parser.add_argument("--output", type=Path, default=RESEARCH_DIR / "backtest_v04_588000_capital_100k.csv")
-    parser.add_argument("--summary", type=Path, default=RESEARCH_DIR / "backtest_v04_588000_capital_100k_summary.csv")
+    parser.add_argument("--trades", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_trades.csv")
+    parser.add_argument("--output", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_capital_100k.csv")
+    parser.add_argument("--summary", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_capital_100k_summary.csv")
     parser.add_argument("--initial-capital", type=float, default=100000.0)
     parser.add_argument("--contract-multiplier", type=float, default=10000.0)
     parser.add_argument("--fee-per-contract-side", type=float, default=2.0)
@@ -115,7 +115,7 @@ def main() -> None:
         curve = pd.concat([pd.Series([args.initial_capital]), active["capital_after"]], ignore_index=True)
         drawdown = (curve.cummax() - curve) / curve.cummax()
         summary = {
-            "strategy_version": "v0.4",
+            "strategy_version": "v0.5",
             "underlying": "588000",
             "initial_capital": args.initial_capital,
             "final_capital": capital,
@@ -133,7 +133,7 @@ def main() -> None:
         }
     else:
         summary = {
-            "strategy_version": "v0.4",
+            "strategy_version": "v0.5",
             "underlying": "588000",
             "initial_capital": args.initial_capital,
             "final_capital": capital,
