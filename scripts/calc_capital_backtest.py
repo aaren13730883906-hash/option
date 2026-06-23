@@ -26,6 +26,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_exit_legs(value: object) -> list[tuple[float, float]]:
+    if isinstance(value, str) and value.strip():
+        legs: list[tuple[float, float]] = []
+        for part in value.split(";"):
+            weight, price = part.split("@", 1)
+            legs.append((float(weight), float(price)))
+        total = sum(weight for weight, _ in legs)
+        if total > 0:
+            return [(weight / total, price) for weight, price in legs]
+    return []
+
+
 def main() -> None:
     args = parse_args()
     trades = pd.read_csv(args.trades, parse_dates=["entry_time", "exit_time"])
@@ -52,23 +64,33 @@ def main() -> None:
             continue
 
         entry_mid = float(trade["entry_price"])
-        exit1_mid = float(trade["exit_price_1"])
-        exit2_mid = float(trade["exit_price_2"])
         entry_fill = entry_mid + args.slippage_tick
-        exit1_fill = max(exit1_mid - args.slippage_tick, 0.0)
-        exit2_fill = max(exit2_mid - args.slippage_tick, 0.0)
         position_pct = float(trade.get("position_pct", 0.10))
         contracts = int((capital * position_pct) // (entry_fill * args.contract_multiplier))
         premium = contracts * entry_fill * args.contract_multiplier
 
-        split_exit = abs(exit1_mid - exit2_mid) > 1e-12
-        sell1_contracts = contracts // 2 if split_exit else 0
-        sell2_contracts = contracts - sell1_contracts
-        gross_sell = (
-            sell1_contracts * exit1_fill * args.contract_multiplier
-            + sell2_contracts * exit2_fill * args.contract_multiplier
-        )
-        fee = contracts * args.fee_per_contract_side + (sell1_contracts + sell2_contracts) * args.fee_per_contract_side
+        legs = parse_exit_legs(trade.get("exit_legs"))
+        if not legs:
+            exit1_mid = float(trade["exit_price_1"])
+            exit2_mid = float(trade["exit_price_2"])
+            if abs(exit1_mid - exit2_mid) > 1e-12:
+                legs = [(0.5, exit1_mid), (0.5, exit2_mid)]
+            else:
+                legs = [(1.0, exit2_mid)]
+        remaining = contracts
+        gross_sell = 0.0
+        exit_leg_text: list[str] = []
+        for idx, (weight, mid_price) in enumerate(legs):
+            if idx == len(legs) - 1:
+                leg_contracts = remaining
+            else:
+                leg_contracts = int(round(contracts * weight))
+                leg_contracts = min(leg_contracts, remaining)
+            remaining -= leg_contracts
+            fill_price = max(mid_price - args.slippage_tick, 0.0)
+            gross_sell += leg_contracts * fill_price * args.contract_multiplier
+            exit_leg_text.append(f"{leg_contracts}@{fill_price:.6f}")
+        fee = contracts * args.fee_per_contract_side + contracts * args.fee_per_contract_side
         net_pnl = gross_sell - premium - fee
         capital_before = capital
         capital += net_pnl
@@ -90,10 +112,8 @@ def main() -> None:
                 "entry_mid": entry_mid,
                 "entry_fill": entry_fill,
                 "exit_reason": trade["exit_reason"],
-                "exit1_mid": exit1_mid,
-                "exit2_mid": exit2_mid,
-                "exit1_fill": exit1_fill,
-                "exit2_fill": exit2_fill,
+                "exit_legs": trade.get("exit_legs", ""),
+                "exit_fills": ";".join(exit_leg_text),
                 "contracts": contracts,
                 "premium": premium,
                 "fee": fee,

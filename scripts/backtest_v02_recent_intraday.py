@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--candidate-pool", type=int, default=8, help="Daily-volume shortlist before iFinD fetch.")
+    parser.add_argument("--strong-trailing-pct", type=float, default=0.20)
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--no-fetch", action="store_true", help="Only use existing intraday cache.")
     return parser.parse_args()
@@ -66,21 +67,76 @@ def load_daily_direction(underlying: str) -> pd.DataFrame:
     df = df[df["underlying_code"] == underlying].copy()
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df = df.sort_values("trade_date")
-    df["ma20"] = df["etf_close"].rolling(20).mean()
-    df["ma20_slope"] = df["ma20"].diff()
-    prev = df[["trade_date", "etf_close", "ma20", "ma20_slope"]].shift(1)
+    for window in [5, 10, 20]:
+        df[f"ma{window}"] = df["etf_close"].rolling(window).mean()
+        df[f"ma{window}_slope"] = df[f"ma{window}"].diff()
+    prev_cols = [
+        "trade_date",
+        "etf_close",
+        "ma5",
+        "ma10",
+        "ma20",
+        "ma5_slope",
+        "ma10_slope",
+        "ma20_slope",
+    ]
+    prev = df[prev_cols].shift(1)
     out = df[["trade_date"]].copy()
     out["trade_date"] = out["trade_date"].dt.strftime("%Y-%m-%d")
     out["daily_ref_date"] = prev["trade_date"].dt.strftime("%Y-%m-%d")
     out["daily_ref_close"] = prev["etf_close"]
+    out["daily_ref_ma5"] = prev["ma5"]
+    out["daily_ref_ma10"] = prev["ma10"]
     out["daily_ref_ma20"] = prev["ma20"]
+    out["daily_ref_ma5_slope"] = prev["ma5_slope"]
+    out["daily_ref_ma10_slope"] = prev["ma10_slope"]
     out["daily_ref_ma20_slope"] = prev["ma20_slope"]
     out["daily_direction"] = "none"
-    bullish = out["daily_ref_close"].gt(out["daily_ref_ma20"]) & out["daily_ref_ma20_slope"].gt(0)
-    bearish = out["daily_ref_close"].lt(out["daily_ref_ma20"]) & out["daily_ref_ma20_slope"].lt(0)
+    bullish = (
+        out["daily_ref_close"].gt(out["daily_ref_ma5"])
+        & out["daily_ref_ma5"].gt(out["daily_ref_ma10"])
+        & out["daily_ref_ma10"].gt(out["daily_ref_ma20"])
+        & out["daily_ref_ma5_slope"].gt(0)
+        & out["daily_ref_ma20_slope"].ge(0)
+    )
+    bearish = (
+        out["daily_ref_close"].lt(out["daily_ref_ma5"])
+        & out["daily_ref_ma5"].lt(out["daily_ref_ma10"])
+        & out["daily_ref_ma10"].lt(out["daily_ref_ma20"])
+        & out["daily_ref_ma5_slope"].lt(0)
+        & out["daily_ref_ma20_slope"].le(0)
+    )
     out.loc[bullish, "daily_direction"] = "call"
     out.loc[bearish, "daily_direction"] = "put"
     return out
+
+
+def daily_breakout_direction(daily_row: pd.Series, etf_close: float) -> str:
+    """Allow fresh daily breakouts before the moving averages fully stack."""
+    values = [
+        daily_row["daily_ref_ma5"],
+        daily_row["daily_ref_ma10"],
+        daily_row["daily_ref_ma20"],
+        daily_row["daily_ref_ma5_slope"],
+        daily_row["daily_ref_ma20_slope"],
+    ]
+    if any(pd.isna(value) for value in values):
+        return "none"
+    above_all = (
+        etf_close > daily_row["daily_ref_ma5"]
+        and etf_close > daily_row["daily_ref_ma10"]
+        and etf_close > daily_row["daily_ref_ma20"]
+    )
+    below_all = (
+        etf_close < daily_row["daily_ref_ma5"]
+        and etf_close < daily_row["daily_ref_ma10"]
+        and etf_close < daily_row["daily_ref_ma20"]
+    )
+    if above_all and daily_row["daily_ref_ma5_slope"] > 0 and daily_row["daily_ref_ma20_slope"] >= 0:
+        return "call"
+    if below_all and daily_row["daily_ref_ma5_slope"] < 0 and daily_row["daily_ref_ma20_slope"] <= 0:
+        return "put"
+    return "none"
 
 
 def ensure_dirs() -> None:
@@ -303,38 +359,197 @@ def option_candidates(daily: pd.DataFrame, trade_date: str, underlying: str, dir
     return d.sort_values("option_volume", ascending=False).head(pool)
 
 
-def simulate_exit(bars_1m: pd.DataFrame, entry_time: pd.Timestamp, entry_price: float) -> dict[str, Any]:
+def bounded(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def score_option_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not candidates:
+        return candidates
+    max_cum_volume = max(item["cum_volume"] for item in candidates) or 1.0
+    max_trend_strength = max(item["option_trend_strength"] for item in candidates) or 1.0
+    for item in candidates:
+        liquidity_score = item["cum_volume"] / max_cum_volume
+        delta_score = bounded(1 - abs(abs(item["delta"]) - 0.50) / 0.15)
+        trend_score = item["option_trend_strength"] / max_trend_strength
+        dte_score = 1.0 if 10 <= item["dte"] <= 25 else 0.65
+        iv_score = bounded(1 - max(item["implied_volatility"] - 0.40, 0) / 0.30)
+        item["selection_score"] = (
+            0.40 * liquidity_score
+            + 0.25 * delta_score
+            + 0.20 * trend_score
+            + 0.10 * dte_score
+            + 0.05 * iv_score
+        )
+        item["selection_liquidity_score"] = liquidity_score
+        item["selection_delta_score"] = delta_score
+        item["selection_trend_score"] = trend_score
+        item["selection_dte_score"] = dte_score
+        item["selection_iv_score"] = iv_score
+    return sorted(candidates, key=lambda x: x["selection_score"], reverse=True)
+
+
+def simulate_exit(
+    bars_1m: pd.DataFrame,
+    entry_time: pd.Timestamp,
+    entry_price: float,
+    signal_strength: str,
+    strong_trailing_pct: float,
+) -> dict[str, Any]:
     stop = entry_price * 0.70
-    tp1 = entry_price * 1.35
-    tp2 = entry_price * 1.60
     eod = pd.Timestamp(f"{entry_time:%Y-%m-%d} 14:55:00")
     path = bars_1m[(bars_1m["datetime"] > entry_time) & (bars_1m["datetime"] <= eod)].copy()
     if path.empty:
-        return {"exit_time": entry_time, "exit_price_1": entry_price, "exit_price_2": entry_price, "return": 0.0, "exit_reason": "no_path"}
+        return {
+            "exit_time": entry_time,
+            "exit_price_1": entry_price,
+            "exit_price_2": entry_price,
+            "return": 0.0,
+            "exit_reason": "no_path",
+            "exit_legs": "1.0@{:.6f}".format(entry_price),
+        }
 
-    half1_done = False
+    is_strong = str(signal_strength).startswith("strong")
+    if not is_strong:
+        tp1 = entry_price * 1.35
+        tp2 = entry_price * 1.80
+        half1_done = False
+        exit1_price = math.nan
+        exit1_time = pd.NaT
+        for row in path.itertuples(index=False):
+            if row.low <= stop:
+                if not half1_done:
+                    return {
+                        "exit_time": row.datetime,
+                        "exit_price_1": stop,
+                        "exit_price_2": stop,
+                        "return": -0.30,
+                        "exit_reason": "stop",
+                        "exit_legs": "1.0@{:.6f}".format(stop),
+                    }
+                ret = 0.5 * (exit1_price / entry_price - 1) + 0.5 * (stop / entry_price - 1)
+                return {
+                    "exit_time": row.datetime,
+                    "exit_price_1": exit1_price,
+                    "exit_price_2": stop,
+                    "return": ret,
+                    "exit_reason": "stop_after_tp1",
+                    "exit_legs": "0.5@{:.6f};0.5@{:.6f}".format(exit1_price, stop),
+                }
+            if not half1_done and row.high >= tp1:
+                half1_done = True
+                exit1_price = tp1
+                exit1_time = row.datetime
+            if half1_done and row.high >= tp2:
+                ret = 0.5 * (exit1_price / entry_price - 1) + 0.5 * (tp2 / entry_price - 1)
+                return {
+                    "exit_time": row.datetime,
+                    "exit_price_1": exit1_price,
+                    "exit_price_2": tp2,
+                    "return": ret,
+                    "exit_reason": "tp2",
+                    "exit_legs": "0.5@{:.6f};0.5@{:.6f}".format(exit1_price, tp2),
+                    "tp1_time": exit1_time,
+                }
+
+        last = path.iloc[-1]
+        if not half1_done:
+            ret = last["close"] / entry_price - 1
+            return {
+                "exit_time": last["datetime"],
+                "exit_price_1": last["close"],
+                "exit_price_2": last["close"],
+                "return": ret,
+                "exit_reason": "eod",
+                "exit_legs": "1.0@{:.6f}".format(last["close"]),
+            }
+        ret = 0.5 * (exit1_price / entry_price - 1) + 0.5 * (last["close"] / entry_price - 1)
+        return {
+            "exit_time": last["datetime"],
+            "exit_price_1": exit1_price,
+            "exit_price_2": last["close"],
+            "return": ret,
+            "exit_reason": "tp1_eod",
+            "exit_legs": "0.5@{:.6f};0.5@{:.6f}".format(exit1_price, last["close"]),
+            "tp1_time": exit1_time,
+        }
+
+    tp1 = entry_price * 1.50
+    first_leg_done = False
     exit1_price = math.nan
     exit1_time = pd.NaT
+    high_water = entry_price
+    trailing_stop = stop
     for row in path.itertuples(index=False):
+        high_water = max(high_water, float(row.high))
         if row.low <= stop:
-            if not half1_done:
-                return {"exit_time": row.datetime, "exit_price_1": stop, "exit_price_2": stop, "return": -0.30, "exit_reason": "stop"}
-            ret = 0.5 * (exit1_price / entry_price - 1) + 0.5 * (stop / entry_price - 1)
-            return {"exit_time": row.datetime, "exit_price_1": exit1_price, "exit_price_2": stop, "return": ret, "exit_reason": "stop_after_tp1"}
-        if not half1_done and row.high >= tp1:
-            half1_done = True
+            if not first_leg_done:
+                return {
+                    "exit_time": row.datetime,
+                    "exit_price_1": stop,
+                    "exit_price_2": stop,
+                    "return": -0.30,
+                    "exit_reason": "stop",
+                    "exit_legs": "1.0@{:.6f}".format(stop),
+                    "high_water": high_water,
+                }
+            ret = (1 / 3) * (exit1_price / entry_price - 1) + (2 / 3) * (stop / entry_price - 1)
+            return {
+                "exit_time": row.datetime,
+                "exit_price_1": exit1_price,
+                "exit_price_2": stop,
+                "return": ret,
+                "exit_reason": "stop_after_tp1",
+                "exit_legs": "0.333333@{:.6f};0.666667@{:.6f}".format(exit1_price, stop),
+                "tp1_time": exit1_time,
+                "high_water": high_water,
+            }
+        if not first_leg_done and row.high >= tp1:
+            first_leg_done = True
             exit1_price = tp1
             exit1_time = row.datetime
-        if half1_done and row.high >= tp2:
-            ret = 0.5 * (exit1_price / entry_price - 1) + 0.5 * (tp2 / entry_price - 1)
-            return {"exit_time": row.datetime, "exit_price_1": exit1_price, "exit_price_2": tp2, "return": ret, "exit_reason": "tp2"}
+            high_water = max(high_water, tp1)
+            trailing_stop = high_water * (1 - strong_trailing_pct)
+        if first_leg_done:
+            trailing_stop = max(trailing_stop, high_water * (1 - strong_trailing_pct))
+            if row.low <= trailing_stop:
+                ret = (1 / 3) * (exit1_price / entry_price - 1) + (2 / 3) * (trailing_stop / entry_price - 1)
+                return {
+                    "exit_time": row.datetime,
+                    "exit_price_1": exit1_price,
+                    "exit_price_2": trailing_stop,
+                    "return": ret,
+                    "exit_reason": f"trail_{strong_trailing_pct:.0%}",
+                    "exit_legs": "0.333333@{:.6f};0.666667@{:.6f}".format(exit1_price, trailing_stop),
+                    "tp1_time": exit1_time,
+                    "high_water": high_water,
+                    "trailing_stop": trailing_stop,
+                }
 
     last = path.iloc[-1]
-    if not half1_done:
+    if not first_leg_done:
         ret = last["close"] / entry_price - 1
-        return {"exit_time": last["datetime"], "exit_price_1": last["close"], "exit_price_2": last["close"], "return": ret, "exit_reason": "eod"}
-    ret = 0.5 * (exit1_price / entry_price - 1) + 0.5 * (last["close"] / entry_price - 1)
-    return {"exit_time": last["datetime"], "exit_price_1": exit1_price, "exit_price_2": last["close"], "return": ret, "exit_reason": "tp1_eod", "tp1_time": exit1_time}
+        return {
+            "exit_time": last["datetime"],
+            "exit_price_1": last["close"],
+            "exit_price_2": last["close"],
+            "return": ret,
+            "exit_reason": "eod",
+            "exit_legs": "1.0@{:.6f}".format(last["close"]),
+            "high_water": high_water,
+        }
+    ret = (1 / 3) * (exit1_price / entry_price - 1) + (2 / 3) * (last["close"] / entry_price - 1)
+    return {
+        "exit_time": last["datetime"],
+        "exit_price_1": exit1_price,
+        "exit_price_2": last["close"],
+        "return": ret,
+        "exit_reason": "tp1_eod",
+        "exit_legs": "0.333333@{:.6f};0.666667@{:.6f}".format(exit1_price, last["close"]),
+        "tp1_time": exit1_time,
+        "high_water": high_water,
+        "trailing_stop": trailing_stop,
+    }
 
 
 def main() -> None:
@@ -360,6 +575,8 @@ def main() -> None:
         day_direction: str | None = None
         entries_by_direction = {"call": 0, "put": 0}
         cooldown_until = {"call": pd.Timestamp.min, "put": pd.Timestamp.min}
+        open_until_by_option: dict[str, pd.Timestamp] = {}
+        day_selected_option: str | None = None
         day_bars = day_bars[(day_bars["time"] >= "09:45") & (day_bars["time"] <= "14:15")]
         day_bars = day_bars[(day_bars["time"] <= "11:00") | (day_bars["time"] >= "13:15")]
         iv_row = market_iv[(market_iv["underlying_code"] == underlying) & (market_iv["trade_date"] == trade_date)]
@@ -372,9 +589,8 @@ def main() -> None:
         daily_dir_row = daily_direction[daily_direction["trade_date"] == trade_date]
         if daily_dir_row.empty:
             continue
-        daily_dir = str(daily_dir_row.iloc[0]["daily_direction"])
-        if daily_dir not in {"call", "put"}:
-            continue
+        daily_row = daily_dir_row.iloc[0]
+        daily_dir = str(daily_row["daily_direction"])
 
         for bar in day_bars.itertuples(index=False):
             if entries >= 2:
@@ -386,7 +602,10 @@ def main() -> None:
             direction = "call" if call_signal else "put" if put_signal else None
             if direction is None:
                 continue
-            if direction != daily_dir:
+            allowed_daily_dir = daily_dir
+            if allowed_daily_dir not in {"call", "put"}:
+                allowed_daily_dir = daily_breakout_direction(daily_row, float(bar.close))
+            if direction != allowed_daily_dir:
                 continue
             if day_direction is not None and direction != day_direction:
                 continue
@@ -401,6 +620,9 @@ def main() -> None:
 
             ranked: list[dict[str, Any]] = []
             for opt in candidates.itertuples(index=False):
+                option_code = str(opt.option_code).zfill(8)
+                if open_until_by_option.get(option_code, pd.Timestamp.min) > bar.datetime:
+                    continue
                 key = (trade_date, opt.option_code)
                 if key not in option_cache:
                     option_cache[key] = fetch_option_1m(
@@ -425,6 +647,7 @@ def main() -> None:
                     continue
                 if not (r["close"] > r["ema5"] > r["ema20"]):
                     continue
+                option_trend_strength = max(float(r["close"] / r["ema20"] - 1), 0.0)
                 ranked.append(
                     {
                         "option_code": opt.option_code,
@@ -433,22 +656,34 @@ def main() -> None:
                         "entry_price": float(r["close"]),
                         "entry_option_volume_15m": float(r["volume"]),
                         "cum_volume": float(cum_vol),
+                        "option_trend_strength": option_trend_strength,
                         "dte": int(opt.dte),
                         "delta": float(opt.delta),
                         "implied_volatility": float(opt.implied_volatility),
                         "bars_1m": opt1,
                     }
                 )
-            ranked = sorted(ranked, key=lambda x: x["cum_volume"], reverse=True)[:3]
+            ranked = score_option_candidates(ranked)
+            if day_selected_option is not None:
+                ranked = [item for item in ranked if str(item["option_code"]).zfill(8) == day_selected_option]
             if not ranked:
                 continue
             chosen = ranked[0]
-            exit_info = simulate_exit(chosen.pop("bars_1m"), bar.datetime, chosen["entry_price"])
+            if day_selected_option is None:
+                day_selected_option = str(chosen["option_code"]).zfill(8)
             position_pct, signal_strength = position_pct_for_signal(iv_rank, etf_volume_ratio)
+            exit_info = simulate_exit(
+                chosen.pop("bars_1m"),
+                bar.datetime,
+                chosen["entry_price"],
+                signal_strength,
+                args.strong_trailing_pct,
+            )
             if str(exit_info.get("exit_reason", "")).startswith("tp"):
                 cooldown_until[direction] = pd.Timestamp(exit_info["exit_time"]) + pd.Timedelta(minutes=30)
             if day_direction is None:
                 day_direction = direction
+            open_until_by_option[str(chosen["option_code"]).zfill(8)] = pd.Timestamp(exit_info["exit_time"])
             trades.append(
                 {
                     "trade_date": trade_date,
@@ -463,10 +698,15 @@ def main() -> None:
                     "signal_strength": signal_strength,
                     "position_pct": position_pct,
                     "daily_direction": daily_dir,
-                    "daily_ref_date": daily_dir_row.iloc[0]["daily_ref_date"],
-                    "daily_ref_close": float(daily_dir_row.iloc[0]["daily_ref_close"]),
-                    "daily_ref_ma20": float(daily_dir_row.iloc[0]["daily_ref_ma20"]),
-                    "daily_ref_ma20_slope": float(daily_dir_row.iloc[0]["daily_ref_ma20_slope"]),
+                    "daily_allowed_direction": allowed_daily_dir,
+                    "daily_ref_date": daily_row["daily_ref_date"],
+                    "daily_ref_close": float(daily_row["daily_ref_close"]),
+                    "daily_ref_ma5": float(daily_row["daily_ref_ma5"]),
+                    "daily_ref_ma10": float(daily_row["daily_ref_ma10"]),
+                    "daily_ref_ma20": float(daily_row["daily_ref_ma20"]),
+                    "daily_ref_ma5_slope": float(daily_row["daily_ref_ma5_slope"]),
+                    "daily_ref_ma10_slope": float(daily_row["daily_ref_ma10_slope"]),
+                    "daily_ref_ma20_slope": float(daily_row["daily_ref_ma20_slope"]),
                     **chosen,
                     **exit_info,
                 }

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import html
 import math
 import re
@@ -21,6 +22,14 @@ TRADES = RESEARCH / "backtest_v05_588000_recent1m_trades.csv"
 CAPITAL = RESEARCH / "backtest_v05_588000_capital_100k.csv"
 MARKET_IV = DATA / "kcb_market_iv_daily.csv"
 OUT = RESEARCH / "trade_review_v05_588000_recent1m.html"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", default=None, help="Filter trades from YYYY-MM-DD.")
+    parser.add_argument("--end", default=None, help="Filter trades through YYYY-MM-DD.")
+    parser.add_argument("--output", type=Path, default=OUT)
+    return parser.parse_args()
 
 
 def fmt(value: object, digits: int = 4) -> str:
@@ -257,9 +266,20 @@ def market_iv_svg(market_iv: pd.DataFrame, trade_date: str) -> str:
     return line_svg(df, "近一个月市场IV与IV Rank（日线）", [("market_iv", "#7b3ff2"), ("iv_rank_252", "#d9861c")], height=220)
 
 
-def build_report() -> str:
+def build_report(start_filter: str | None = None, end_filter: str | None = None) -> str:
     trades = pd.read_csv(TRADES, parse_dates=["entry_time", "exit_time"], dtype={"option_code": str})
+    if start_filter:
+        trades = trades[trades["trade_date"] >= start_filter]
+    if end_filter:
+        trades = trades[trades["trade_date"] <= end_filter]
+    trades = trades.reset_index(drop=True)
+    if trades.empty:
+        raise RuntimeError("No trades matched the requested date range.")
     cap = pd.read_csv(CAPITAL, parse_dates=["entry_time"])
+    if start_filter:
+        cap = cap[cap["trade_date"] >= start_filter]
+    if end_filter:
+        cap = cap[cap["trade_date"] <= end_filter]
     market_iv = pd.read_csv(MARKET_IV, dtype={"underlying_code": str})
     start, end = trades["trade_date"].min(), trades["trade_date"].max()
     market_iv = market_iv[(market_iv["underlying_code"] == "588000") & (market_iv["trade_date"].between(start, end))]
@@ -272,7 +292,18 @@ def build_report() -> str:
         opt1 = option_1m(trade_date, str(trade["option_code"]))
         opt15 = option_15m(opt1)
         opt_iv = add_intraday_iv(opt1, etf5, trade)
-        cap_row = cap_lookup.loc[(trade_date, trade["contract_id"], trade["entry_time"])]
+        cap_key = (trade_date, trade["contract_id"], trade["entry_time"])
+        cap_row = cap_lookup.loc[cap_key] if cap_key in cap_lookup.index else pd.Series(dtype=object)
+        contracts = cap_row.get("contracts")
+        contracts_text = "-" if pd.isna(contracts) else f"{int(contracts)}张"
+        net_pnl = cap_row.get("net_pnl")
+        premium_return = cap_row.get("return_on_premium")
+        skip_reason = cap_row.get("skip_reason")
+        pnl_text = (
+            f"未成交 / {html.escape(str(skip_reason))}"
+            if pd.notna(skip_reason)
+            else f"{fmt(net_pnl, 2)} 元 / 权利金收益 {pct(premium_return)}"
+        )
         entry_time = pd.Timestamp(trade["entry_time"])
         exit_time = pd.Timestamp(trade["exit_time"])
         entry_etf = float(trade["etf_close"])
@@ -296,8 +327,8 @@ def build_report() -> str:
           <div><b>出场</b><span>{exit_time.strftime('%H:%M')} / {html.escape(str(trade['exit_reason']))}</span></div>
           <div><b>合约</b><span>DTE {int(trade['dte'])} / Delta {fmt(trade['delta'], 3)} / IV {pct(trade['implied_volatility'])}</span></div>
           <div><b>市场IV</b><span>{pct(trade['market_iv'])} / Rank {pct(trade['iv_rank_252'])}</span></div>
-          <div><b>仓位</b><span>{pct(trade['position_pct'])} / {html.escape(str(trade['signal_strength']))} / {int(cap_row['contracts'])}张</span></div>
-          <div><b>盈亏</b><span>{fmt(cap_row['net_pnl'], 2)} 元 / 权利金收益 {pct(cap_row['return_on_premium'])}</span></div>
+          <div><b>仓位</b><span>{pct(trade['position_pct'])} / {html.escape(str(trade['signal_strength']))} / {contracts_text}</span></div>
+          <div><b>盈亏</b><span>{pnl_text}</span></div>
         </div>
         <p class="reason">{html.escape(reason)}</p>
         """
@@ -342,8 +373,9 @@ def build_report() -> str:
 
 
 def main() -> None:
-    OUT.write_text(build_report(), encoding="utf-8")
-    print(OUT)
+    args = parse_args()
+    args.output.write_text(build_report(args.start, args.end), encoding="utf-8")
+    print(args.output)
 
 
 if __name__ == "__main__":
