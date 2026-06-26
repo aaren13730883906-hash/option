@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fee-per-contract-side", type=float, default=2.0)
     parser.add_argument("--slippage-tick", type=float, default=0.0001)
     parser.add_argument("--daily-loss-limit-pct", type=float, default=0.05)
+    parser.add_argument("--strategy-version", default="v1.0B")
     return parser.parse_args()
 
 
@@ -135,7 +136,7 @@ def main() -> None:
         curve = pd.concat([pd.Series([args.initial_capital]), active["capital_after"]], ignore_index=True)
         drawdown = (curve.cummax() - curve) / curve.cummax()
         summary = {
-            "strategy_version": "v0.5",
+            "strategy_version": args.strategy_version,
             "underlying": "588000",
             "initial_capital": args.initial_capital,
             "final_capital": capital,
@@ -153,7 +154,7 @@ def main() -> None:
         }
     else:
         summary = {
-            "strategy_version": "v0.5",
+            "strategy_version": args.strategy_version,
             "underlying": "588000",
             "initial_capital": args.initial_capital,
             "final_capital": capital,

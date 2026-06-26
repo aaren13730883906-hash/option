@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backtest the v0.5 588000 ETF option intraday framework on recent data.
+"""Backtest the v0.9 588000 ETF option intraday framework on recent data.
 
 This is a first-pass research backtest:
   - ETF trend signal comes from local 5m ETF data resampled to 15m.
@@ -48,17 +48,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--candidate-pool", type=int, default=8, help="Daily-volume shortlist before iFinD fetch.")
     parser.add_argument("--strong-trailing-pct", type=float, default=0.20)
+    parser.add_argument("--entry-start-time", default="09:35")
+    parser.add_argument("--force-entry-time", default=None)
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--no-fetch", action="store_true", help="Only use existing intraday cache.")
     return parser.parse_args()
 
 
 def position_pct_for_signal(iv_rank: float, etf_volume_ratio: float) -> tuple[float, str]:
-    """Return premium allocation and signal label for v0.5 sizing."""
+    """Return premium allocation and signal label for v0.9 sizing."""
     strong = etf_volume_ratio >= 2.0
     if iv_rank >= 0.35:
-        return (0.10, "strong_reduced") if strong else (0.07, "reduced")
-    return (0.15, "strong") if strong else (0.10, "normal")
+        return (0.15, "strong_reduced") if strong else (0.10, "reduced")
+    return (0.20, "strong") if strong else (0.20, "normal")
+
+
+def reduce_position(position_pct: float, signal_strength: str, reason: str) -> tuple[float, str]:
+    if position_pct >= 0.15:
+        return 0.10, f"{signal_strength}_{reason}"
+    if position_pct >= 0.10:
+        return 0.07, f"{signal_strength}_{reason}"
+    return position_pct, signal_strength
 
 
 def load_daily_direction(underlying: str) -> pd.DataFrame:
@@ -70,6 +80,11 @@ def load_daily_direction(underlying: str) -> pd.DataFrame:
     for window in [5, 10, 20]:
         df[f"ma{window}"] = df["etf_close"].rolling(window).mean()
         df[f"ma{window}_slope"] = df[f"ma{window}"].diff()
+    df["ma_cluster"] = (df[["ma5", "ma10", "ma20"]].max(axis=1) - df[["ma5", "ma10", "ma20"]].min(axis=1)) / df["etf_close"]
+    day_range = (df["etf_high"] - df["etf_low"]).replace(0, pd.NA)
+    df["upper_shadow_ratio"] = (df["etf_high"] - df[["etf_open", "etf_close"]].max(axis=1)) / day_range
+    df["lower_shadow_ratio"] = (df[["etf_open", "etf_close"]].min(axis=1) - df["etf_low"]) / day_range
+    df["volume_ratio20"] = df["etf_volume"] / df["etf_volume"].rolling(20).mean()
     prev_cols = [
         "trade_date",
         "etf_close",
@@ -79,6 +94,10 @@ def load_daily_direction(underlying: str) -> pd.DataFrame:
         "ma5_slope",
         "ma10_slope",
         "ma20_slope",
+        "ma_cluster",
+        "upper_shadow_ratio",
+        "lower_shadow_ratio",
+        "volume_ratio20",
     ]
     prev = df[prev_cols].shift(1)
     out = df[["trade_date"]].copy()
@@ -91,6 +110,10 @@ def load_daily_direction(underlying: str) -> pd.DataFrame:
     out["daily_ref_ma5_slope"] = prev["ma5_slope"]
     out["daily_ref_ma10_slope"] = prev["ma10_slope"]
     out["daily_ref_ma20_slope"] = prev["ma20_slope"]
+    out["daily_ref_ma_cluster"] = prev["ma_cluster"]
+    out["daily_ref_upper_shadow_ratio"] = prev["upper_shadow_ratio"]
+    out["daily_ref_lower_shadow_ratio"] = prev["lower_shadow_ratio"]
+    out["daily_ref_volume_ratio20"] = prev["volume_ratio20"]
     out["daily_direction"] = "none"
     bullish = (
         out["daily_ref_close"].gt(out["daily_ref_ma5"])
@@ -307,12 +330,49 @@ def load_etf_15m(sqlite_path: Path, underlyings: list[str], start: str, end: str
     out = pd.concat(frames, ignore_index=True).sort_values(["underlying_code", "datetime"])
     out["trade_date"] = out["datetime"].dt.strftime("%Y-%m-%d")
     out["time"] = out["datetime"].dt.strftime("%H:%M")
+    out["day_cum_volume"] = out.groupby(["underlying_code", "trade_date"])["volume"].cumsum()
+    out["progress_volume_mean20"] = out.groupby(["underlying_code", "time"])["day_cum_volume"].transform(
+        lambda s: s.shift(1).rolling(20).mean()
+    )
+    out["intraday_volume_progress_ratio"] = out["day_cum_volume"] / out["progress_volume_mean20"]
     out["ema5"] = out.groupby("underlying_code")["close"].transform(lambda s: s.ewm(span=5, adjust=False).mean())
     out["ema20"] = out.groupby("underlying_code")["close"].transform(lambda s: s.ewm(span=20, adjust=False).mean())
     out["ema20_slope"] = out.groupby("underlying_code")["ema20"].diff()
     out["prev5_vol_mean"] = out.groupby("underlying_code")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
     out["prev3_high"] = out.groupby("underlying_code")["high"].transform(lambda s: s.shift(1).rolling(3).max())
     out["prev3_low"] = out.groupby("underlying_code")["low"].transform(lambda s: s.shift(1).rolling(3).min())
+    return out
+
+
+def load_etf_5m(sqlite_path: Path, underlyings: list[str], start: str, end: str) -> pd.DataFrame:
+    symbols = [f"{code}.SH" for code in underlyings]
+    params: list[object] = symbols + [start.replace("-", ""), end.replace("-", "")]
+    sql = f"""
+        select symbol, dt, date, open, high, low, close, volume, amount
+        from bars_5m
+        where symbol in ({",".join("?" for _ in symbols)})
+          and date between ? and ?
+        order by symbol, dt
+    """
+    with sqlite3.connect(sqlite_path) as conn:
+        out = pd.read_sql_query(sql, conn, params=params)
+    if out.empty:
+        raise RuntimeError(f"No ETF 5m bars found in {sqlite_path}")
+    out["datetime"] = pd.to_datetime(out["dt"])
+    out["underlying_code"] = out["symbol"].str.slice(0, 6)
+    out["trade_date"] = out["datetime"].dt.strftime("%Y-%m-%d")
+    out["time"] = out["datetime"].dt.strftime("%H:%M")
+    out = out.sort_values(["underlying_code", "datetime"])
+    out["day_cum_volume"] = out.groupby(["underlying_code", "trade_date"])["volume"].cumsum()
+    out["progress_volume_mean20"] = out.groupby(["underlying_code", "time"])["day_cum_volume"].transform(
+        lambda s: s.shift(1).rolling(20).mean()
+    )
+    out["intraday_volume_progress_ratio"] = out["day_cum_volume"] / out["progress_volume_mean20"]
+    out["ema5"] = out.groupby("underlying_code")["close"].transform(lambda s: s.ewm(span=5, adjust=False).mean())
+    out["ema20"] = out.groupby("underlying_code")["close"].transform(lambda s: s.ewm(span=20, adjust=False).mean())
+    out["ema20_slope"] = out.groupby("underlying_code")["ema20"].diff()
+    out["prev_high"] = out.groupby("underlying_code")["high"].shift(1)
+    out["prev_low"] = out.groupby("underlying_code")["low"].shift(1)
     return out
 
 
@@ -391,13 +451,22 @@ def score_option_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, 
 
 def simulate_exit(
     bars_1m: pd.DataFrame,
+    etf_15m: pd.DataFrame,
     entry_time: pd.Timestamp,
     entry_price: float,
+    direction: str,
     signal_strength: str,
     strong_trailing_pct: float,
+    soft_stop_pct: float = 0.82,
+    soft_stop_delay_minutes: int = 0,
 ) -> dict[str, Any]:
     stop = entry_price * 0.70
+    soft_stop = entry_price * soft_stop_pct
+    soft_stop_ts = entry_time + pd.Timedelta(minutes=soft_stop_delay_minutes)
     eod = pd.Timestamp(f"{entry_time:%Y-%m-%d} 14:55:00")
+    bars_1m = bars_1m.copy()
+    if "ema5" not in bars_1m.columns:
+        bars_1m["ema5"] = bars_1m["close"].ewm(span=5, adjust=False).mean()
     path = bars_1m[(bars_1m["datetime"] > entry_time) & (bars_1m["datetime"] <= eod)].copy()
     if path.empty:
         return {
@@ -417,6 +486,33 @@ def simulate_exit(
         exit1_price = math.nan
         exit1_time = pd.NaT
         for row in path.itertuples(index=False):
+            opt_weak = pd.notna(row.ema5) and row.close < row.ema5
+            etf_row = etf_15m[etf_15m["datetime"] <= row.datetime].tail(1)
+            etf_reversal = False
+            if not etf_row.empty:
+                e = etf_row.iloc[0]
+                etf_reversal = (
+                    direction == "call"
+                    and pd.notna(e["ema20"])
+                    and pd.notna(e["ema20_slope"])
+                    and e["close"] < e["ema20"]
+                    and e["ema20_slope"] < 0
+                ) or (
+                    direction == "put"
+                    and pd.notna(e["ema20"])
+                    and pd.notna(e["ema20_slope"])
+                    and e["close"] > e["ema20"]
+                    and e["ema20_slope"] > 0
+                )
+            if row.datetime >= soft_stop_ts and not half1_done and row.low <= soft_stop and (opt_weak or etf_reversal):
+                return {
+                    "exit_time": row.datetime,
+                    "exit_price_1": soft_stop,
+                    "exit_price_2": soft_stop,
+                    "return": soft_stop / entry_price - 1,
+                    "exit_reason": "soft_stop",
+                    "exit_legs": "1.0@{:.6f}".format(soft_stop),
+                }
             if row.low <= stop:
                 if not half1_done:
                     return {
@@ -482,6 +578,34 @@ def simulate_exit(
     trailing_stop = stop
     for row in path.itertuples(index=False):
         high_water = max(high_water, float(row.high))
+        opt_weak = pd.notna(row.ema5) and row.close < row.ema5
+        etf_row = etf_15m[etf_15m["datetime"] <= row.datetime].tail(1)
+        etf_reversal = False
+        if not etf_row.empty:
+            e = etf_row.iloc[0]
+            etf_reversal = (
+                direction == "call"
+                and pd.notna(e["ema20"])
+                and pd.notna(e["ema20_slope"])
+                and e["close"] < e["ema20"]
+                and e["ema20_slope"] < 0
+            ) or (
+                direction == "put"
+                and pd.notna(e["ema20"])
+                and pd.notna(e["ema20_slope"])
+                and e["close"] > e["ema20"]
+                and e["ema20_slope"] > 0
+            )
+        if row.datetime >= soft_stop_ts and not first_leg_done and row.low <= soft_stop and (opt_weak or etf_reversal):
+            return {
+                "exit_time": row.datetime,
+                "exit_price_1": soft_stop,
+                "exit_price_2": soft_stop,
+                "return": soft_stop / entry_price - 1,
+                "exit_reason": "soft_stop",
+                "exit_legs": "1.0@{:.6f}".format(soft_stop),
+                "high_water": high_water,
+            }
         if row.low <= stop:
             if not first_leg_done:
                 return {
@@ -509,9 +633,11 @@ def simulate_exit(
             exit1_price = tp1
             exit1_time = row.datetime
             high_water = max(high_water, tp1)
-            trailing_stop = high_water * (1 - strong_trailing_pct)
+            trail_pct = 0.35 if pd.Timestamp(row.datetime).time() < pd.Timestamp("10:30").time() else strong_trailing_pct
+            trailing_stop = high_water * (1 - trail_pct)
         if first_leg_done:
-            trailing_stop = max(trailing_stop, high_water * (1 - strong_trailing_pct))
+            trail_pct = 0.35 if pd.Timestamp(row.datetime).time() < pd.Timestamp("10:30").time() else strong_trailing_pct
+            trailing_stop = max(trailing_stop, high_water * (1 - trail_pct))
             if row.low <= trailing_stop:
                 ret = (1 / 3) * (exit1_price / entry_price - 1) + (2 / 3) * (trailing_stop / entry_price - 1)
                 return {
@@ -519,7 +645,7 @@ def simulate_exit(
                     "exit_price_1": exit1_price,
                     "exit_price_2": trailing_stop,
                     "return": ret,
-                    "exit_reason": f"trail_{strong_trailing_pct:.0%}",
+                    "exit_reason": f"trail_{trail_pct:.0%}",
                     "exit_legs": "0.333333@{:.6f};0.666667@{:.6f}".format(exit1_price, trailing_stop),
                     "tp1_time": exit1_time,
                     "high_water": high_water,
@@ -565,19 +691,31 @@ def main() -> None:
     market_iv = market_iv[(market_iv["trade_date"] >= start.strftime("%Y-%m-%d")) & (market_iv["trade_date"] <= end.strftime("%Y-%m-%d"))]
     daily_direction = load_daily_direction(args.underlying)
     etf15 = load_etf_15m(args.sqlite, underlyings, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    etf5 = load_etf_5m(args.sqlite, underlyings, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    early5 = etf5[etf5["time"].isin(["09:35", "09:40"])].copy()
+    early5["bar_interval"] = "5m"
+    early5["prev3_high"] = early5["prev_high"]
+    early5["prev3_low"] = early5["prev_low"]
+    early5["prev5_vol_mean"] = pd.NA
+    etf15 = etf15.copy()
+    etf15["bar_interval"] = "15m"
+    signal_bars = pd.concat([early5, etf15], ignore_index=True, sort=False).sort_values(
+        ["underlying_code", "datetime"]
+    )
     token = None if args.no_fetch else get_access_token()
     headers = {"Content-Type": "application/json", "access_token": token} if token else {}
 
     trades: list[dict[str, Any]] = []
     option_cache: dict[tuple[str, str], pd.DataFrame] = {}
-    for (underlying, trade_date), day_bars in etf15.groupby(["underlying_code", "trade_date"], sort=True):
+    for (underlying, trade_date), day_bars in signal_bars.groupby(["underlying_code", "trade_date"], sort=True):
+        day_all_bars = etf15[(etf15["underlying_code"] == underlying) & (etf15["trade_date"] == trade_date)].copy()
         entries = 0
         day_direction: str | None = None
         entries_by_direction = {"call": 0, "put": 0}
         cooldown_until = {"call": pd.Timestamp.min, "put": pd.Timestamp.min}
         open_until_by_option: dict[str, pd.Timestamp] = {}
         day_selected_option: str | None = None
-        day_bars = day_bars[(day_bars["time"] >= "09:45") & (day_bars["time"] <= "14:15")]
+        day_bars = day_bars[(day_bars["time"] >= args.entry_start_time) & (day_bars["time"] <= "14:15")]
         day_bars = day_bars[(day_bars["time"] <= "11:00") | (day_bars["time"] >= "13:15")]
         iv_row = market_iv[(market_iv["underlying_code"] == underlying) & (market_iv["trade_date"] == trade_date)]
         if iv_row.empty:
@@ -591,16 +729,48 @@ def main() -> None:
             continue
         daily_row = daily_dir_row.iloc[0]
         daily_dir = str(daily_row["daily_direction"])
+        ma_cluster = float(daily_row["daily_ref_ma_cluster"]) if pd.notna(daily_row["daily_ref_ma_cluster"]) else math.nan
+        daily_volume_ratio20 = (
+            float(daily_row["daily_ref_volume_ratio20"]) if pd.notna(daily_row["daily_ref_volume_ratio20"]) else math.nan
+        )
+        if pd.isna(ma_cluster) or ma_cluster < 0.015:
+            continue
+        if pd.notna(daily_volume_ratio20) and daily_volume_ratio20 < 0.65:
+            continue
 
         for bar in day_bars.itertuples(index=False):
             if entries >= 2:
                 break
-            vol_ok = pd.notna(bar.prev5_vol_mean) and bar.prev5_vol_mean > 0 and bar.volume >= 1.5 * bar.prev5_vol_mean
-            etf_volume_ratio = float(bar.volume / bar.prev5_vol_mean) if pd.notna(bar.prev5_vol_mean) and bar.prev5_vol_mean > 0 else 0.0
-            call_signal = bar.close > bar.prev3_high and bar.ema5 > bar.ema20 and bar.ema20_slope > 0 and vol_ok
-            put_signal = bar.close < bar.prev3_low and bar.ema5 < bar.ema20 and bar.ema20_slope < 0 and vol_ok
+            bar_range = float(bar.high - bar.low)
+            close_pos = float((bar.close - bar.low) / bar_range) if bar_range > 0 else 0.5
+            is_early = str(bar.bar_interval) == "5m"
+            elastic_call = bar.close > bar.open and close_pos >= (0.80 if is_early else 0.70)
+            elastic_put = bar.close < bar.open and close_pos <= (0.20 if is_early else 0.30)
+            progress_ratio = (
+                float(bar.intraday_volume_progress_ratio)
+                if pd.notna(bar.intraday_volume_progress_ratio)
+                else math.nan
+            )
+            if pd.notna(progress_ratio) and progress_ratio < 0.80:
+                continue
+            if is_early:
+                vol_threshold = 1.5
+                vol_ok = pd.notna(progress_ratio) and progress_ratio >= 1.50
+                etf_volume_ratio = progress_ratio if pd.notna(progress_ratio) else 0.0
+                call_signal = elastic_call and bar.ema5 > bar.ema20 and bar.ema20_slope > 0 and vol_ok
+                put_signal = elastic_put and bar.ema5 < bar.ema20 and bar.ema20_slope < 0 and vol_ok
+            else:
+                vol_threshold = 1.2 if elastic_call or elastic_put else 1.5
+                vol_ok = pd.notna(bar.prev5_vol_mean) and bar.prev5_vol_mean > 0 and bar.volume >= vol_threshold * bar.prev5_vol_mean
+                etf_volume_ratio = float(bar.volume / bar.prev5_vol_mean) if pd.notna(bar.prev5_vol_mean) and bar.prev5_vol_mean > 0 else 0.0
+                call_signal = bar.close > bar.prev3_high and bar.ema5 > bar.ema20 and bar.ema20_slope > 0 and vol_ok
+                put_signal = bar.close < bar.prev3_low and bar.ema5 < bar.ema20 and bar.ema20_slope < 0 and vol_ok
             direction = "call" if call_signal else "put" if put_signal else None
             if direction is None:
+                continue
+            if direction == "call" and close_pos < (0.80 if is_early else 0.75 if bar.time == "09:45" else 0.65):
+                continue
+            if direction == "put" and close_pos > (0.20 if is_early else 0.25 if bar.time == "09:45" else 0.35):
                 continue
             allowed_daily_dir = daily_dir
             if allowed_daily_dir not in {"call", "put"}:
@@ -613,6 +783,7 @@ def main() -> None:
                 continue
             if bar.datetime < cooldown_until[direction]:
                 continue
+            execution_time = pd.Timestamp(f"{trade_date} {args.force_entry_time}:00") if args.force_entry_time else bar.datetime
 
             candidates = option_candidates(daily, trade_date, underlying, direction, args.candidate_pool)
             if candidates.empty:
@@ -621,7 +792,7 @@ def main() -> None:
             ranked: list[dict[str, Any]] = []
             for opt in candidates.itertuples(index=False):
                 option_code = str(opt.option_code).zfill(8)
-                if open_until_by_option.get(option_code, pd.Timestamp.min) > bar.datetime:
+                if open_until_by_option.get(option_code, pd.Timestamp.min) > execution_time:
                     continue
                 key = (trade_date, opt.option_code)
                 if key not in option_cache:
@@ -637,12 +808,20 @@ def main() -> None:
                 opt1 = option_cache[key]
                 if opt1.empty:
                     continue
-                opt15 = resample_option_15m(opt1)
-                row = opt15[opt15["datetime"] == bar.datetime]
-                if row.empty:
-                    continue
-                r = row.iloc[0]
-                cum_vol = opt1[opt1["datetime"] <= bar.datetime]["volume"].sum()
+                if is_early or args.force_entry_time:
+                    opt_path = opt1[opt1["datetime"] <= execution_time].copy()
+                    if opt_path.empty:
+                        continue
+                    opt_path["ema5"] = opt_path["close"].ewm(span=5, adjust=False).mean()
+                    opt_path["ema20"] = opt_path["close"].ewm(span=20, adjust=False).mean()
+                    r = opt_path.iloc[-1]
+                else:
+                    opt15 = resample_option_15m(opt1)
+                    row = opt15[opt15["datetime"] == execution_time]
+                    if row.empty:
+                        continue
+                    r = row.iloc[0]
+                cum_vol = opt1[opt1["datetime"] <= execution_time]["volume"].sum()
                 if cum_vol <= 0 or r["volume"] <= 0:
                     continue
                 if not (r["close"] > r["ema5"] > r["ema20"]):
@@ -672,10 +851,34 @@ def main() -> None:
             if day_selected_option is None:
                 day_selected_option = str(chosen["option_code"]).zfill(8)
             position_pct, signal_strength = position_pct_for_signal(iv_rank, etf_volume_ratio)
+            risk_flags: list[str] = []
+            if ma_cluster < 0.022:
+                position_pct, signal_strength = reduce_position(position_pct, signal_strength, "cluster")
+                risk_flags.append("ma_cluster")
+            if pd.notna(daily_volume_ratio20) and daily_volume_ratio20 < 0.80:
+                if signal_strength.startswith("strong"):
+                    position_pct, signal_strength = 0.10, "normal_low_daily_volume"
+                else:
+                    position_pct, signal_strength = reduce_position(position_pct, signal_strength, "low_daily_volume")
+                risk_flags.append("low_daily_volume")
+            if pd.notna(progress_ratio) and progress_ratio < 1.00:
+                position_pct, signal_strength = reduce_position(position_pct, signal_strength, "low_intraday_volume")
+                risk_flags.append("low_intraday_volume")
+            if signal_strength.startswith("strong") and pd.notna(progress_ratio) and progress_ratio < 1.50:
+                position_pct, signal_strength = 0.10, "normal_intraday_volume"
+                risk_flags.append("strong_blocked_intraday_volume")
+            if direction == "call" and pd.notna(daily_row["daily_ref_upper_shadow_ratio"]) and daily_row["daily_ref_upper_shadow_ratio"] > 0.45:
+                position_pct, signal_strength = reduce_position(position_pct, signal_strength, "upper_shadow")
+                risk_flags.append("upper_shadow")
+            if direction == "put" and pd.notna(daily_row["daily_ref_lower_shadow_ratio"]) and daily_row["daily_ref_lower_shadow_ratio"] > 0.45:
+                position_pct, signal_strength = reduce_position(position_pct, signal_strength, "lower_shadow")
+                risk_flags.append("lower_shadow")
             exit_info = simulate_exit(
                 chosen.pop("bars_1m"),
-                bar.datetime,
+                day_all_bars,
+                execution_time,
                 chosen["entry_price"],
+                direction,
                 signal_strength,
                 args.strong_trailing_pct,
             )
@@ -689,14 +892,19 @@ def main() -> None:
                     "trade_date": trade_date,
                     "underlying_code": underlying,
                     "direction": direction,
-                    "entry_time": bar.datetime,
+                    "entry_time": execution_time,
+                    "signal_time": bar.datetime,
                     "etf_close": bar.close,
                     "etf_volume_15m": bar.volume,
                     "market_iv": iv,
                     "iv_rank_252": iv_rank,
                     "etf_volume_ratio": etf_volume_ratio,
+                    "etf_intraday_volume_progress_ratio": progress_ratio,
+                    "etf_vol_threshold": vol_threshold,
+                    "etf_close_pos": close_pos,
                     "signal_strength": signal_strength,
                     "position_pct": position_pct,
+                    "risk_flags": ",".join(risk_flags),
                     "daily_direction": daily_dir,
                     "daily_allowed_direction": allowed_daily_dir,
                     "daily_ref_date": daily_row["daily_ref_date"],
@@ -707,6 +915,18 @@ def main() -> None:
                     "daily_ref_ma5_slope": float(daily_row["daily_ref_ma5_slope"]),
                     "daily_ref_ma10_slope": float(daily_row["daily_ref_ma10_slope"]),
                     "daily_ref_ma20_slope": float(daily_row["daily_ref_ma20_slope"]),
+                    "daily_ref_ma_cluster": ma_cluster,
+                    "daily_ref_volume_ratio20": float(daily_volume_ratio20) if pd.notna(daily_volume_ratio20) else math.nan,
+                    "daily_ref_upper_shadow_ratio": (
+                        float(daily_row["daily_ref_upper_shadow_ratio"])
+                        if pd.notna(daily_row["daily_ref_upper_shadow_ratio"])
+                        else math.nan
+                    ),
+                    "daily_ref_lower_shadow_ratio": (
+                        float(daily_row["daily_ref_lower_shadow_ratio"])
+                        if pd.notna(daily_row["daily_ref_lower_shadow_ratio"])
+                        else math.nan
+                    ),
                     **chosen,
                     **exit_info,
                 }

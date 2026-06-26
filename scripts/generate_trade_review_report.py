@@ -21,6 +21,7 @@ SQLITE = Path("/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.s
 TRADES = RESEARCH / "backtest_v05_588000_recent1m_trades.csv"
 CAPITAL = RESEARCH / "backtest_v05_588000_capital_100k.csv"
 MARKET_IV = DATA / "kcb_market_iv_daily.csv"
+ETF_DAILY = DATA / "etf_daily_588000_588080.csv"
 OUT = RESEARCH / "trade_review_v05_588000_recent1m.html"
 
 
@@ -129,6 +130,29 @@ def etf_15m_for_day(trade_date: str) -> pd.DataFrame:
     return day[(day["datetime"].dt.strftime("%H:%M") >= "09:30") & (day["datetime"].dt.strftime("%H:%M") <= "15:00")]
 
 
+def etf_daily_window(trade_date: str, before: int = 30, after: int = 8) -> pd.DataFrame:
+    df = pd.read_csv(ETF_DAILY, dtype={"underlying_code": str})
+    df = df[df["underlying_code"] == "588000"].copy()
+    df["datetime"] = pd.to_datetime(df["trade_date"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    df = df.rename(
+        columns={
+            "etf_open": "open",
+            "etf_high": "high",
+            "etf_low": "low",
+            "etf_close": "close",
+            "etf_volume": "volume",
+        }
+    )
+    for window in [5, 10, 20]:
+        df[f"ema{window}"] = df["close"].rolling(window).mean()
+    idx = df.index[df["trade_date"] == trade_date]
+    if len(idx) == 0:
+        return df.tail(before + after + 1)
+    i = int(idx[0])
+    return df.iloc[max(0, i - before) : min(len(df), i + after + 1)].copy()
+
+
 def option_1m(trade_date: str, option_code: str) -> pd.DataFrame:
     path = INTRADAY / f"{trade_date}_{str(option_code).zfill(8)}_1m.csv"
     df = pd.read_csv(path, parse_dates=["datetime"], dtype={"option_code": str})
@@ -197,7 +221,7 @@ def polyline(df: pd.DataFrame, x_fn, y_fn, col: str, color: str, width: float = 
     return f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linejoin="round" stroke-linecap="round"/>'
 
 
-def candle_svg(df: pd.DataFrame, title: str, entry_time, exit_time, entry_price, exit_price, *, width=1120, height=360) -> str:
+def candle_svg(df: pd.DataFrame, title: str, entry_time, exit_time, entry_price, exit_price, *, width=1120, height=360, tick_format="%H:%M") -> str:
     left, right, top, price_bottom, vol_top, bottom = 58, width - 22, 34, 238, 260, height - 28
     x_fn = x_scale(df["datetime"], left, right)
     y_price = scale(pd.concat([df["high"], df["low"], df.get("ema5", df["close"]), df.get("ema20", df["close"])]), top, price_bottom)
@@ -223,6 +247,8 @@ def candle_svg(df: pd.DataFrame, title: str, entry_time, exit_time, entry_price,
         parts.append(f'<rect x="{x - body_w / 2:.1f}" y="{yv:.1f}" width="{body_w:.1f}" height="{bottom - yv:.1f}" fill="#8aa0b8" opacity="0.38"/>')
     if "ema5" in df:
         parts.append(polyline(df, x_fn, y_price, "ema5", "#d9861c", 1.8))
+    if "ema10" in df:
+        parts.append(polyline(df, x_fn, y_price, "ema10", "#16a34a", 1.6))
     if "ema20" in df:
         parts.append(polyline(df, x_fn, y_price, "ema20", "#2f6fbb", 1.8))
     for label, t, p, color in [("ENTRY", entry_time, entry_price, "#7b3ff2"), ("EXIT", exit_time, exit_price, "#111827")]:
@@ -234,8 +260,8 @@ def candle_svg(df: pd.DataFrame, title: str, entry_time, exit_time, entry_price,
     tick_rows = df.iloc[:: max(len(df) // 6, 1)]
     for row in tick_rows.itertuples():
         x = x_fn(row.datetime)
-        parts.append(f'<text x="{x:.1f}" y="{height - 8}" class="tick" text-anchor="middle">{pd.Timestamp(row.datetime).strftime("%H:%M")}</text>')
-    parts.append('<text x="960" y="22" class="legend"><tspan fill="#d9861c">EMA5</tspan>  <tspan fill="#2f6fbb">EMA20</tspan>  <tspan fill="#8aa0b8">Volume</tspan></text>')
+        parts.append(f'<text x="{x:.1f}" y="{height - 8}" class="tick" text-anchor="middle">{pd.Timestamp(row.datetime).strftime(tick_format)}</text>')
+    parts.append('<text x="900" y="22" class="legend"><tspan fill="#d9861c">MA/EMA5</tspan>  <tspan fill="#16a34a">MA10</tspan>  <tspan fill="#2f6fbb">MA/EMA20</tspan>  <tspan fill="#8aa0b8">Volume</tspan></text>')
     parts.append("</svg>")
     return "\n".join(parts)
 
@@ -280,18 +306,16 @@ def build_report(start_filter: str | None = None, end_filter: str | None = None)
         cap = cap[cap["trade_date"] >= start_filter]
     if end_filter:
         cap = cap[cap["trade_date"] <= end_filter]
-    market_iv = pd.read_csv(MARKET_IV, dtype={"underlying_code": str})
     start, end = trades["trade_date"].min(), trades["trade_date"].max()
-    market_iv = market_iv[(market_iv["underlying_code"] == "588000") & (market_iv["trade_date"].between(start, end))]
     cap_lookup = cap.set_index(["trade_date", "contract_id", "entry_time"])
     sections = []
     for idx, trade in trades.iterrows():
         trade_date = str(trade["trade_date"])
+        etf_daily = etf_daily_window(trade_date)
         etf15 = etf_15m_for_day(trade_date)
         etf5 = load_etf_5m(trade_date, trade_date)
         opt1 = option_1m(trade_date, str(trade["option_code"]))
         opt15 = option_15m(opt1)
-        opt_iv = add_intraday_iv(opt1, etf5, trade)
         cap_key = (trade_date, trade["contract_id"], trade["entry_time"])
         cap_row = cap_lookup.loc[cap_key] if cap_key in cap_lookup.index else pd.Series(dtype=object)
         contracts = cap_row.get("contracts")
@@ -337,10 +361,9 @@ def build_report(start_filter: str | None = None, end_filter: str | None = None)
             <section>
               <h2>{html.escape(header)}</h2>
               {cards}
+              {candle_svg(etf_daily, '588000 ETF日K：价格、MA与成交量', pd.Timestamp(trade_date), pd.Timestamp(trade_date), entry_etf, entry_etf, tick_format="%m-%d")}
               {candle_svg(etf15, '588000 ETF 15分钟K线：价格、EMA与成交量', entry_time, exit_time, entry_etf, exit_etf)}
               {candle_svg(opt15, '期权15分钟K线：价格、EMA与成交量', entry_time, exit_time, entry_option, exit_option)}
-              {line_svg(opt_iv, '期权1分钟：价格EMA与反推IV曲线', [('close', '#111827'), ('ema5', '#d9861c'), ('ema20', '#2f6fbb'), ('iv_calc', '#7b3ff2')])}
-              {market_iv_svg(market_iv, trade_date)}
             </section>
             """
         )
@@ -365,8 +388,8 @@ def build_report(start_filter: str | None = None, end_filter: str | None = None)
     <html lang="zh-CN"><head><meta charset="utf-8"><title>v0.5 588000期权交易复盘</title>{style}</head>
     <body>
       <header>
-        <h1>v0.5 588000期权交易复盘</h1>
-        <p class="sub">区间：{html.escape(start)} 至 {html.escape(end)}；每笔图表展示 ETF、合约、成交量、均线、IV 与入出场位置。</p>
+        <h1>588000期权交易复盘</h1>
+        <p class="sub">区间：{html.escape(start)} 至 {html.escape(end)}；每笔图表展示 ETF日K、ETF盘中、合约盘中、成交量、均线与入出场位置。</p>
       </header>
       {''.join(sections)}
     </body></html>"""
