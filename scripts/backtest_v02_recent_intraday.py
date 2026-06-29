@@ -52,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-entry-time", default=None)
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--no-fetch", action="store_true", help="Only use existing intraday cache.")
+    parser.add_argument("--output", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_trades.csv")
+    parser.add_argument("--summary", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_summary.csv")
     return parser.parse_args()
 
 
@@ -935,8 +937,10 @@ def main() -> None:
             entries_by_direction[direction] += 1
 
     trades_df = pd.DataFrame(trades)
-    trades_path = RESEARCH_DIR / "backtest_v05_588000_recent1m_trades.csv"
-    summary_path = RESEARCH_DIR / "backtest_v05_588000_recent1m_summary.csv"
+    trades_path = args.output
+    summary_path = args.summary
+    trades_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     trades_df.to_csv(trades_path, index=False)
     if trades_df.empty:
         summary = pd.DataFrame([{"trades": 0, "start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d")}])
