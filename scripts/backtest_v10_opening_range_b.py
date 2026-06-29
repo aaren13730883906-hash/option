@@ -32,9 +32,12 @@ ETF_1M_ROOT = Path("/Users/aaren/策略/A股数据/基金_分钟数据/ETF_分�
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=366)
-    parser.add_argument("--underlying", choices=["588000"], default="588000")
+    parser.add_argument("--underlying", choices=["588000", "159915"], default="588000")
     parser.add_argument("--sqlite", type=Path, default=bt.DEFAULT_SQLITE)
     parser.add_argument("--etf-1m-root", type=Path, default=ETF_1M_ROOT)
+    parser.add_argument("--daily-csv", type=Path, default=bt.DAILY_CSV)
+    parser.add_argument("--market-iv-csv", type=Path, default=bt.MARKET_IV_CSV)
+    parser.add_argument("--etf-daily-csv", type=Path, default=bt.ETF_DAILY_CSV)
     parser.add_argument("--candidate-pool", type=int, default=8)
     parser.add_argument("--strong-trailing-pct", type=float, default=0.25)
     parser.add_argument("--range-threshold", type=float, default=0.003)
@@ -62,7 +65,7 @@ def load_etf_1m(root: Path, trade_date: str, underlying: str) -> pd.DataFrame:
     ym = trade_date[:7]
     ymd = trade_date.replace("-", "")
     zip_path = root / ym / f"{ymd}_1min.zip"
-    member = f"{underlying}.SH.csv"
+    member = f"{bt.market_symbol(underlying)}.csv"
     if not zip_path.exists():
         return pd.DataFrame()
     with zipfile.ZipFile(zip_path) as zf:
@@ -390,14 +393,14 @@ def main() -> None:
     bt.ensure_dirs()
     RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
 
-    daily = pd.read_csv(bt.DAILY_CSV, dtype={"option_code": str, "contract_id": str, "underlying_code": str})
-    market_iv = pd.read_csv(bt.MARKET_IV_CSV, dtype={"underlying_code": str})
+    daily = pd.read_csv(args.daily_csv, dtype={"option_code": str, "contract_id": str, "underlying_code": str})
+    market_iv = pd.read_csv(args.market_iv_csv, dtype={"underlying_code": str})
     end = pd.to_datetime(daily["trade_date"].max())
     start = end - pd.Timedelta(days=args.days)
     daily = daily[(daily["trade_date"] >= start.strftime("%Y-%m-%d")) & (daily["trade_date"] <= end.strftime("%Y-%m-%d"))]
     daily = daily[daily["underlying_code"] == args.underlying].copy()
     market_iv = market_iv[(market_iv["trade_date"] >= start.strftime("%Y-%m-%d")) & (market_iv["trade_date"] <= end.strftime("%Y-%m-%d"))]
-    daily_direction = bt.load_daily_direction(args.underlying)
+    daily_direction = bt.load_daily_direction(args.underlying, args.etf_daily_csv)
     etf15 = bt.load_etf_15m(args.sqlite, [args.underlying], start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
     headers = None
     if args.fetch_missing:

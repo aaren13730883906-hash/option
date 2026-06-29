@@ -42,7 +42,7 @@ INDICATORS = "open,high,low,close,volume,amount,changeRatio"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=31)
-    parser.add_argument("--underlying", choices=["588000"], default="588000")
+    parser.add_argument("--underlying", choices=["588000", "159915"], default="588000")
     parser.add_argument("--sqlite", type=Path, default=DEFAULT_SQLITE)
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--retries", type=int, default=3)
@@ -78,9 +78,22 @@ def reduce_position(position_pct: float, signal_strength: str, reason: str) -> t
     return position_pct, signal_strength
 
 
-def load_daily_direction(underlying: str) -> pd.DataFrame:
+def market_symbol(underlying: str) -> str:
+    """Return the exchange-qualified ETF symbol used by local archives."""
+    suffix = "SZ" if str(underlying).startswith(("15", "16")) else "SH"
+    return f"{underlying}.{suffix}"
+
+
+def option_thscode(option_code: str) -> str:
+    """Return the iFinD code for an SSE/SZSE ETF option numeric code."""
+    code = str(option_code).zfill(8)
+    suffix = "SZ" if code.startswith("9") else "SH"
+    return f"{code}.{suffix}"
+
+
+def load_daily_direction(underlying: str, etf_daily_csv: Path = ETF_DAILY_CSV) -> pd.DataFrame:
     """Use the previous completed daily bar to decide the tradable direction."""
-    df = pd.read_csv(ETF_DAILY_CSV, dtype={"underlying_code": str})
+    df = pd.read_csv(etf_daily_csv, dtype={"underlying_code": str})
     df = df[df["underlying_code"] == underlying].copy()
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df = df.sort_values("trade_date")
@@ -280,7 +293,7 @@ def fetch_option_1m(
         return pd.DataFrame()
 
     body = {
-        "codes": f"{option_code}.SH",
+        "codes": option_thscode(option_code),
         "indicators": INDICATORS,
         "starttime": f"{trade_date} 09:30:00",
         "endtime": f"{trade_date} 15:00:00",
@@ -305,7 +318,7 @@ def fetch_option_1m(
 
 
 def load_etf_15m(sqlite_path: Path, underlyings: list[str], start: str, end: str) -> pd.DataFrame:
-    symbols = [f"{code}.SH" for code in underlyings]
+    symbols = [market_symbol(code) for code in underlyings]
     params: list[object] = symbols + [start.replace("-", ""), end.replace("-", "")]
     sql = f"""
         select symbol, dt, date, open, high, low, close, volume, amount
@@ -352,7 +365,7 @@ def load_etf_15m(sqlite_path: Path, underlyings: list[str], start: str, end: str
 
 
 def load_etf_5m(sqlite_path: Path, underlyings: list[str], start: str, end: str) -> pd.DataFrame:
-    symbols = [f"{code}.SH" for code in underlyings]
+    symbols = [market_symbol(code) for code in underlyings]
     params: list[object] = symbols + [start.replace("-", ""), end.replace("-", "")]
     sql = f"""
         select symbol, dt, date, open, high, low, close, volume, amount
