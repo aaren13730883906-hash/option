@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-entry-time", default=None)
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--no-fetch", action="store_true", help="Only use existing intraday cache.")
+    parser.add_argument(
+        "--daily-volume-tiered",
+        action="store_true",
+        help="Keep signals at 0.65-0.80 prior-day volume ratio and multiply position by 0.70.",
+    )
     parser.add_argument("--output", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_trades.csv")
     parser.add_argument("--summary", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_summary.csv")
     return parser.parse_args()
@@ -737,7 +742,11 @@ def main() -> None:
         )
         if pd.isna(ma_cluster) or ma_cluster < 0.015:
             continue
-        if pd.notna(daily_volume_ratio20) and daily_volume_ratio20 < 0.65:
+        if args.daily_volume_tiered and (
+            pd.isna(daily_volume_ratio20) or daily_volume_ratio20 < 0.65
+        ):
+            continue
+        if not args.daily_volume_tiered and pd.notna(daily_volume_ratio20) and daily_volume_ratio20 < 0.65:
             continue
 
         for bar in day_bars.itertuples(index=False):
@@ -858,11 +867,16 @@ def main() -> None:
                 position_pct, signal_strength = reduce_position(position_pct, signal_strength, "cluster")
                 risk_flags.append("ma_cluster")
             if pd.notna(daily_volume_ratio20) and daily_volume_ratio20 < 0.80:
-                if signal_strength.startswith("strong"):
+                if args.daily_volume_tiered:
+                    position_pct *= 0.70
+                    signal_strength = f"{signal_strength}_daily_volume_reduced"
+                    risk_flags.append("daily_volume_70pct")
+                elif signal_strength.startswith("strong"):
                     position_pct, signal_strength = 0.10, "normal_low_daily_volume"
                 else:
                     position_pct, signal_strength = reduce_position(position_pct, signal_strength, "low_daily_volume")
-                risk_flags.append("low_daily_volume")
+                if not args.daily_volume_tiered:
+                    risk_flags.append("low_daily_volume")
             if pd.notna(progress_ratio) and progress_ratio < 1.00:
                 position_pct, signal_strength = reduce_position(position_pct, signal_strength, "low_intraday_volume")
                 risk_flags.append("low_intraday_volume")

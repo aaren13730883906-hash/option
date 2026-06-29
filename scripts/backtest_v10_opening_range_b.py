@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strong-position-pct", type=float, default=0.70)
     parser.add_argument("--soft-stop-pct", type=float, default=0.75)
     parser.add_argument("--soft-stop-delay-minutes", type=int, default=5)
+    parser.add_argument(
+        "--daily-volume-tiered",
+        action="store_true",
+        help="Block prior-day volume ratio below 0.65 and multiply position by 0.70 below 0.80.",
+    )
     parser.add_argument("--fetch-missing", action="store_true", help="Fetch only missing option 1m caches via iFinD.")
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--retries", type=int, default=3)
@@ -248,7 +253,12 @@ def confirm_0945(etf1: pd.DataFrame, etf15_day: pd.DataFrame, signal: dict[str, 
     return bool(float(row1["close"]) < signal["opening_low"] and float(row15["close"]) < float(row15["ema5"]))
 
 
-def early_position_pct(signal: dict[str, Any], selected: dict[str, Any], args: argparse.Namespace) -> tuple[float, str]:
+def early_position_pct(
+    signal: dict[str, Any],
+    selected: dict[str, Any],
+    daily_row: pd.Series,
+    args: argparse.Namespace,
+) -> tuple[float, str]:
     strong = signal["breakout_vol_ratio"] >= 2.0
     pct = args.strong_position_pct if strong else args.normal_position_pct
     label = "strong" if strong else "normal"
@@ -256,6 +266,10 @@ def early_position_pct(signal: dict[str, Any], selected: dict[str, Any], args: a
     if pd.notna(iv) and iv >= 0.50:
         pct *= 0.70
         label += "_iv_reduced"
+    daily_volume_ratio20 = daily_row.get("daily_ref_volume_ratio20", math.nan)
+    if args.daily_volume_tiered and pd.notna(daily_volume_ratio20) and float(daily_volume_ratio20) < 0.80:
+        pct *= 0.70
+        label += "_daily_volume_reduced"
     return pct, label
 
 
@@ -277,7 +291,7 @@ def build_trade(
     if first is None or float(first["close"]) <= 0:
         return None
     first_price = float(first["close"])
-    target_pct, signal_strength = early_position_pct(signal, selected, args)
+    target_pct, signal_strength = early_position_pct(signal, selected, daily_row, args)
     first_pct = target_pct * args.first_leg_ratio
     actual_pct = first_pct
     entry_price = first_price
@@ -396,6 +410,7 @@ def main() -> None:
         "missing_etf_1m": 0,
         "no_opening_signal": 0,
         "no_contract": 0,
+        "daily_volume_blocked": 0,
         "missing_option_cache": 0,
         "fetched_option_cache": 0,
     }
@@ -410,6 +425,13 @@ def main() -> None:
             stats["no_opening_signal"] += 1
             continue
         daily_row = daily_dir_row.iloc[0]
+        daily_volume_ratio20 = daily_row.get("daily_ref_volume_ratio20", math.nan)
+        if (
+            args.daily_volume_tiered
+            and (pd.isna(daily_volume_ratio20) or float(daily_volume_ratio20) < 0.65)
+        ):
+            stats["daily_volume_blocked"] += 1
+            continue
         direction = str(daily_row["daily_direction"])
         signal = find_opening_breakout(etf1, direction, args)
         if signal is None:
