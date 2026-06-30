@@ -44,18 +44,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--days", type=int, default=31)
     parser.add_argument("--underlying", choices=["588000", "159915"], default="588000")
     parser.add_argument("--sqlite", type=Path, default=DEFAULT_SQLITE)
+    parser.add_argument("--daily-csv", type=Path, default=DAILY_CSV)
+    parser.add_argument("--market-iv-csv", type=Path, default=MARKET_IV_CSV)
+    parser.add_argument("--etf-daily-csv", type=Path, default=ETF_DAILY_CSV)
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--candidate-pool", type=int, default=8, help="Daily-volume shortlist before iFinD fetch.")
     parser.add_argument("--strong-trailing-pct", type=float, default=0.20)
     parser.add_argument("--entry-start-time", default="09:35")
     parser.add_argument("--force-entry-time", default=None)
+    parser.add_argument(
+        "--execute-0945-at-0946",
+        action="store_true",
+        help="Confirm the 09:45 15m signal at its close and fill at the 09:46 option-bar open.",
+    )
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--no-fetch", action="store_true", help="Only use existing intraday cache.")
     parser.add_argument(
         "--daily-volume-tiered",
         action="store_true",
         help="Keep signals at 0.65-0.80 prior-day volume ratio and multiply position by 0.70.",
+    )
+    parser.add_argument(
+        "--strong-signals-only",
+        action="store_true",
+        help="Reject non-strong ETF bars before contract selection and trade-state updates.",
     )
     parser.add_argument("--output", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_trades.csv")
     parser.add_argument("--summary", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_summary.csv")
@@ -414,7 +427,14 @@ def resample_option_15m(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def option_candidates(daily: pd.DataFrame, trade_date: str, underlying: str, direction: str, pool: int) -> pd.DataFrame:
+def option_candidates(
+    daily: pd.DataFrame,
+    trade_date: str,
+    underlying: str,
+    direction: str,
+    pool: int,
+    allow_edge_dte: bool = False,
+) -> pd.DataFrame:
     td = pd.Timestamp(trade_date)
     cur_ym = td.year * 100 + td.month
     nxt_ym = next_month_ym(td)
@@ -429,14 +449,24 @@ def option_candidates(daily: pd.DataFrame, trade_date: str, underlying: str, dir
     d["expiry_date"] = d["expiry_ym"].map(expiry_date)
     d["dte"] = (d["expiry_date"] - td).dt.days
     d["abs_delta"] = d["delta"].abs()
-    d = d[
+    common = (
         d["expiry_ym"].isin([cur_ym, nxt_ym])
-        & d["dte"].between(10, 35)
         & d["abs_delta"].between(0.35, 0.65)
         & d["implied_volatility"].between(0.20, 0.70)
         & (d["option_volume"] > 0)
-    ]
-    return d.sort_values("option_volume", ascending=False).head(pool)
+    )
+    normal = d[common & d["dte"].between(10, 35)].copy()
+    if not normal.empty:
+        normal["edge_dte_candidate"] = False
+        normal["dte_position_factor"] = 1.0
+        return normal.sort_values("option_volume", ascending=False).head(pool)
+    if not allow_edge_dte:
+        return normal
+    edge_band = d["dte"].between(7, 9) | d["dte"].between(36, 40)
+    edge = d[common & edge_band].copy()
+    edge["edge_dte_candidate"] = True
+    edge["dte_position_factor"] = 0.60
+    return edge.sort_values("option_volume", ascending=False).head(pool)
 
 
 def bounded(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -701,15 +731,15 @@ def simulate_exit(
 def main() -> None:
     args = parse_args()
     ensure_dirs()
-    daily = pd.read_csv(DAILY_CSV, dtype={"option_code": str, "contract_id": str, "underlying_code": str})
-    market_iv = pd.read_csv(MARKET_IV_CSV, dtype={"underlying_code": str})
+    daily = pd.read_csv(args.daily_csv, dtype={"option_code": str, "contract_id": str, "underlying_code": str})
+    market_iv = pd.read_csv(args.market_iv_csv, dtype={"underlying_code": str})
     end = pd.to_datetime(daily["trade_date"].max())
     start = end - pd.Timedelta(days=args.days)
     underlyings = [args.underlying]
     daily = daily[(daily["trade_date"] >= start.strftime("%Y-%m-%d")) & (daily["trade_date"] <= end.strftime("%Y-%m-%d"))]
     daily = daily[daily["underlying_code"].isin(underlyings)].copy()
     market_iv = market_iv[(market_iv["trade_date"] >= start.strftime("%Y-%m-%d")) & (market_iv["trade_date"] <= end.strftime("%Y-%m-%d"))]
-    daily_direction = load_daily_direction(args.underlying)
+    daily_direction = load_daily_direction(args.underlying, args.etf_daily_csv)
     etf15 = load_etf_15m(args.sqlite, underlyings, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
     etf5 = load_etf_5m(args.sqlite, underlyings, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
     early5 = etf5[etf5["time"].isin(["09:35", "09:40"])].copy()
@@ -792,6 +822,8 @@ def main() -> None:
             direction = "call" if call_signal else "put" if put_signal else None
             if direction is None:
                 continue
+            if args.strong_signals_only and etf_volume_ratio < 2.0:
+                continue
             if direction == "call" and close_pos < (0.80 if is_early else 0.75 if bar.time == "09:45" else 0.65):
                 continue
             if direction == "put" and close_pos > (0.20 if is_early else 0.25 if bar.time == "09:45" else 0.35):
@@ -807,7 +839,20 @@ def main() -> None:
                 continue
             if bar.datetime < cooldown_until[direction]:
                 continue
-            execution_time = pd.Timestamp(f"{trade_date} {args.force_entry_time}:00") if args.force_entry_time else bar.datetime
+            signal_time = pd.Timestamp(bar.datetime)
+            delayed_0945_fill = (
+                args.execute_0945_at_0946
+                and str(bar.bar_interval) == "15m"
+                and str(bar.time) == "09:45"
+                and args.force_entry_time is None
+            )
+            execution_time = (
+                signal_time + pd.Timedelta(minutes=1)
+                if delayed_0945_fill
+                else pd.Timestamp(f"{trade_date} {args.force_entry_time}:00")
+                if args.force_entry_time
+                else signal_time
+            )
 
             candidates = option_candidates(daily, trade_date, underlying, direction, args.candidate_pool)
             if candidates.empty:
@@ -833,7 +878,7 @@ def main() -> None:
                 if opt1.empty:
                     continue
                 if is_early or args.force_entry_time:
-                    opt_path = opt1[opt1["datetime"] <= execution_time].copy()
+                    opt_path = opt1[opt1["datetime"] <= signal_time].copy()
                     if opt_path.empty:
                         continue
                     opt_path["ema5"] = opt_path["close"].ewm(span=5, adjust=False).mean()
@@ -841,22 +886,39 @@ def main() -> None:
                     r = opt_path.iloc[-1]
                 else:
                     opt15 = resample_option_15m(opt1)
-                    row = opt15[opt15["datetime"] == execution_time]
+                    row = opt15[opt15["datetime"] == signal_time]
                     if row.empty:
                         continue
                     r = row.iloc[0]
-                cum_vol = opt1[opt1["datetime"] <= execution_time]["volume"].sum()
+                cum_vol = opt1[opt1["datetime"] <= signal_time]["volume"].sum()
                 if cum_vol <= 0 or r["volume"] <= 0:
                     continue
                 if not (r["close"] > r["ema5"] > r["ema20"]):
                     continue
+                if delayed_0945_fill:
+                    fill_rows = opt1[opt1["datetime"] >= execution_time].head(1)
+                    if fill_rows.empty:
+                        continue
+                    fill_row = fill_rows.iloc[0]
+                    fill_price = (
+                        float(fill_row["open"])
+                        if pd.notna(fill_row["open"]) and float(fill_row["open"]) > 0
+                        else float(fill_row["close"])
+                    )
+                    fill_time = pd.Timestamp(fill_row["datetime"])
+                else:
+                    fill_price = float(r["close"])
+                    fill_time = execution_time
                 option_trend_strength = max(float(r["close"] / r["ema20"] - 1), 0.0)
                 ranked.append(
                     {
                         "option_code": opt.option_code,
                         "contract_id": opt.contract_id,
                         "contract_symbol": opt.contract_symbol,
-                        "entry_price": float(r["close"]),
+                        "entry_price": fill_price,
+                        "signal_option_price": float(r["close"]),
+                        "execution_time": fill_time,
+                        "entry_price_source": "next_minute_open" if delayed_0945_fill else "signal_bar_close",
                         "entry_option_volume_15m": float(r["volume"]),
                         "cum_volume": float(cum_vol),
                         "option_trend_strength": option_trend_strength,
@@ -872,6 +934,7 @@ def main() -> None:
             if not ranked:
                 continue
             chosen = ranked[0]
+            execution_time = pd.Timestamp(chosen.pop("execution_time"))
             if day_selected_option is None:
                 day_selected_option = str(chosen["option_code"]).zfill(8)
             position_pct, signal_strength = position_pct_for_signal(iv_rank, etf_volume_ratio)
@@ -922,7 +985,7 @@ def main() -> None:
                     "underlying_code": underlying,
                     "direction": direction,
                     "entry_time": execution_time,
-                    "signal_time": bar.datetime,
+                    "signal_time": signal_time,
                     "etf_close": bar.close,
                     "etf_volume_15m": bar.volume,
                     "market_iv": iv,

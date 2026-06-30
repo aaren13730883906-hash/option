@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cyb-trades",
         type=Path,
-        default=RESEARCH / "backtest_v12_159915_opening_trades.csv",
+        default=RESEARCH / "backtest_v12_159915_opening_plus_strong15m_trades.csv",
     )
     parser.add_argument(
         "--output",
@@ -117,6 +117,7 @@ def main() -> None:
         "159915": {"range": 0.0025, "volume": 1.25},
     }
     trades["opening_strength_score"] = pd.NA
+    trades["fallback_strength_score"] = pd.NA
     for idx, trade in trades.iterrows():
         underlying = str(trade["underlying_code"])
         params = thresholds[underlying]
@@ -126,6 +127,21 @@ def main() -> None:
             trades.loc[idx, "opening_strength_score"] = (
                 float(amp) / params["range"]
             ) * (float(volume) / params["volume"])
+        if str(trade.get("strategy_leg")) == "strong_15m_fallback":
+            volume_ratio = pd.to_numeric(trade.get("etf_volume_ratio"), errors="coerce")
+            volume_threshold = pd.to_numeric(trade.get("etf_vol_threshold"), errors="coerce")
+            close_pos = pd.to_numeric(trade.get("etf_close_pos"), errors="coerce")
+            direction = str(trade.get("direction"))
+            signal_time = pd.to_datetime(trade.get("signal_time"), errors="coerce")
+            close_threshold = 0.75 if pd.notna(signal_time) and signal_time.strftime("%H:%M") == "09:45" else 0.65
+            if direction == "put":
+                close_strength = (1.0 - float(close_pos)) / (1.0 - close_threshold)
+            else:
+                close_strength = float(close_pos) / close_threshold
+            if pd.notna(volume_ratio) and pd.notna(volume_threshold) and float(volume_threshold) > 0:
+                trades.loc[idx, "fallback_strength_score"] = (
+                    float(volume_ratio) / float(volume_threshold)
+                ) * close_strength
 
     overlapping_dates = set(
         trades.groupby("trade_date")["underlying_code"].nunique().loc[lambda s: s > 1].index
@@ -136,15 +152,29 @@ def main() -> None:
         if len(day["underlying_code"].unique()) == 1:
             selected_rows.append(day)
             continue
-        ranked = day.sort_values(
-            ["opening_strength_score", "underlying_code"],
-            ascending=[False, True],
-            na_position="last",
-        )
+        opening = day[day["strategy_leg"].astype(str) == "opening_primary"]
+        if not opening.empty:
+            ranked = opening.sort_values(
+                ["opening_strength_score", "underlying_code"],
+                ascending=[False, True],
+                na_position="last",
+            )
+        else:
+            signal_times = pd.to_datetime(day["signal_time"], errors="coerce")
+            earliest = signal_times.min()
+            eligible = day[signal_times == earliest] if pd.notna(earliest) else day
+            ranked = eligible.sort_values(
+                ["fallback_strength_score", "underlying_code"],
+                ascending=[False, True],
+                na_position="last",
+            )
         selected_rows.append(ranked.head(1))
     trades = pd.concat(selected_rows, ignore_index=True)
     trades["selection_rule"] = "single_signal"
-    trades.loc[trades["dual_signal_date"], "selection_rule"] = "stronger_opening_only"
+    overlap_opening = trades["dual_signal_date"] & (trades["strategy_leg"].astype(str) == "opening_primary")
+    overlap_fallback = trades["dual_signal_date"] & (trades["strategy_leg"].astype(str) == "strong_15m_fallback")
+    trades.loc[overlap_opening, "selection_rule"] = "opening_priority_stronger_opening"
+    trades.loc[overlap_fallback, "selection_rule"] = "earliest_fallback_then_stronger_signal"
     trades = trades.sort_values(["trade_date", "entry_time", "underlying_code"]).reset_index(drop=True)
     trades.to_csv(args.output, index=False)
 
@@ -207,7 +237,7 @@ def main() -> None:
         "win_rate_net": float((capital_df["net_pnl"] > 0).mean()),
         "total_fees": float(capital_df["fee"].sum()),
         "max_drawdown": float(drawdown.max()),
-        "overlap_policy": "higher normalized opening strength only",
+        "overlap_policy": "opening priority; otherwise earliest fallback then stronger normalized signal",
     }
     pd.DataFrame([summary]).to_csv(args.summary, index=False)
     print(pd.DataFrame([summary]).to_string(index=False))
