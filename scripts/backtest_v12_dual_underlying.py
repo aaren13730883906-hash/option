@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cyb-trades",
         type=Path,
-        default=RESEARCH / "backtest_v12_159915_opening_plus_strong15m_trades.csv",
+        default=RESEARCH / "backtest_v12_159915_opening_trades.csv",
     )
     parser.add_argument(
         "--output",

@@ -13,6 +13,7 @@ import sqlite3
 import sys
 from io import BytesIO
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any
 
 import pandas as pd
@@ -36,19 +37,72 @@ SZSE_REPORT_URL = "https://www.sse.org.cn/api/report/ShowReport"
 IFIND_HISTORY_URL = "https://quantapi.51ifind.com/api/v1/cmd_history_quotation"
 
 # These dates are generated solely from local ETF data from 2025-07-04 onward.
-# The CYB opening thresholds are 0.25% range amplitude and 1.25x breakout
-# volume. 2025-07-21 has no contract satisfying the DTE rule, but is retained
-# so the empty candidate result remains explicit and reproducible.
+# They are the union of the CYB opening-range signals and strong 15-minute
+# fallback signals. The opening thresholds are 0.25% range amplitude and 1.25x
+# breakout volume; the fallback starts with the completed 09:45 bar.
 SIGNALS = {
+    "2025-07-04": "call",
+    "2025-07-09": "call",
+    "2025-07-15": "call",
+    "2025-07-16": "call",
+    "2025-07-17": "call",
     "2025-07-21": "call",
+    "2025-07-22": "call",
     "2025-07-23": "call",
+    "2025-07-24": "call",
+    "2025-07-28": "call",
+    "2025-08-19": "call",
     "2025-08-22": "call",
+    "2025-09-03": "call",
+    "2025-09-11": "call",
     "2025-09-17": "call",
     "2025-09-19": "call",
+    "2025-09-25": "call",
+    "2025-09-29": "call",
+    "2025-10-27": "call",
+    "2025-10-29": "call",
+    "2025-12-10": "call",
+    "2025-12-11": "call",
     "2025-12-24": "call",
+    "2026-01-06": "call",
+    "2026-01-13": "call",
     "2026-01-15": "call",
+    "2026-03-09": "put",
+    "2026-03-11": "call",
+    "2026-04-16": "call",
+    "2026-04-17": "call",
     "2026-04-22": "call",
+    "2026-05-11": "call",
 }
+
+
+def implied_volatility_from_greeks(
+    delta: float,
+    gamma: float,
+    spot: float,
+    dte: int,
+    option_type: str,
+    dividend_yield: float = 0.0,
+) -> float:
+    """Recover the Black-Scholes volatility used to produce Delta and Gamma."""
+    values = [delta, gamma, spot, float(dte), dividend_yield]
+    if not all(math.isfinite(float(value)) for value in values):
+        return math.nan
+    if gamma <= 0 or spot <= 0 or dte <= 0:
+        return math.nan
+
+    tau = dte / 365.0
+    discount = math.exp(-dividend_yield * tau)
+    delta_probability = delta / discount
+    if option_type == "put":
+        delta_probability += 1.0
+    if not 0.0 < delta_probability < 1.0:
+        return math.nan
+
+    d1 = NormalDist().inv_cdf(delta_probability)
+    normal_density = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+    volatility = discount * normal_density / (spot * gamma * math.sqrt(tau))
+    return volatility if 0.01 <= volatility <= 3.0 else math.nan
 
 
 def fourth_wednesday(year: int, month: int) -> pd.Timestamp:
@@ -195,7 +249,7 @@ def fetch_daily_quotes(rows: pd.DataFrame, headers: dict[str, str]) -> pd.DataFr
 
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    build_etf_daily()
+    etf_daily = build_etf_daily()
     market_iv = build_market_iv()
 
     risk_frames: list[pd.DataFrame] = []
@@ -205,12 +259,22 @@ def main() -> None:
         raw["trade_date"] = trade_date
         parsed = pd.DataFrame([parse_contract(row) for _, row in raw.iterrows()])
         parsed["dte"] = (parsed["expiry_date"] - pd.Timestamp(trade_date)).dt.days
-        parsed = parsed[
+        common = parsed[
             (parsed["option_type"] == SIGNALS[trade_date])
-            & parsed["dte"].between(10, 35)
             & parsed["delta"].abs().between(0.35, 0.65)
-        ]
-        risk_frames.append(parsed)
+        ].copy()
+        normal = common[common["dte"].between(10, 35)].copy()
+        if not normal.empty:
+            normal["edge_dte_candidate"] = False
+            normal["dte_position_factor"] = 1.0
+            risk_frames.append(normal)
+        else:
+            edge = common[
+                common["dte"].between(7, 9) | common["dte"].between(36, 40)
+            ].copy()
+            edge["edge_dte_candidate"] = True
+            edge["dte_position_factor"] = 0.60
+            risk_frames.append(edge)
 
     risk = pd.concat(risk_frames, ignore_index=True) if risk_frames else pd.DataFrame()
     risk.to_csv(RISK_OUTPUT, index=False)
@@ -224,8 +288,23 @@ def main() -> None:
         on="trade_date",
         how="left",
     )
-    daily["implied_volatility"] = daily["market_iv"]
-    daily["iv_source"] = "cyb_qvix_proxy"
+    daily = daily.merge(
+        etf_daily[["trade_date", "etf_close"]],
+        on="trade_date",
+        how="left",
+    )
+    daily["implied_volatility"] = daily.apply(
+        lambda row: implied_volatility_from_greeks(
+            delta=float(row["delta"]),
+            gamma=float(row["gamma"]),
+            spot=float(row["etf_close"]),
+            dte=int(row["dte"]),
+            option_type=str(row["option_type"]),
+        ),
+        axis=1,
+    )
+    daily["iv_source"] = "szse_delta_gamma_derived"
+    daily["iv_gap_vs_market"] = daily["implied_volatility"] - daily["market_iv"]
     rename = {
         "open": "option_open",
         "high": "option_high",
@@ -247,6 +326,7 @@ def main() -> None:
         {
             "risk_rows": len(risk),
             "quoted_rows": int(daily["option_volume"].notna().sum()),
+            "derived_iv_rows": int(daily["implied_volatility"].notna().sum()),
             "signal_dates": int(daily["trade_date"].nunique()),
             "output": str(DAILY_OUTPUT),
         },

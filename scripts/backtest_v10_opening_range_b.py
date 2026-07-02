@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Block prior-day volume ratio below 0.65 and multiply position by 0.70 below 0.80.",
     )
+    parser.add_argument(
+        "--edge-dte-fallback",
+        action="store_true",
+        help="If DTE 10-35 is empty, allow DTE 7-9 or 36-40 at 60% size.",
+    )
     parser.add_argument("--fetch-missing", action="store_true", help="Fetch only missing option 1m caches via iFinD.")
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--retries", type=int, default=3)
@@ -192,8 +197,16 @@ def select_contract(
     fetch_missing: bool = False,
     sleep: float = 0.15,
     retries: int = 3,
+    allow_edge_dte: bool = False,
 ) -> tuple[dict[str, Any] | None, int, int]:
-    daily_candidates = bt.option_candidates(daily, trade_date, underlying, direction, candidate_pool)
+    daily_candidates = bt.option_candidates(
+        daily,
+        trade_date,
+        underlying,
+        direction,
+        candidate_pool,
+        allow_edge_dte=allow_edge_dte,
+    )
     if daily_candidates.empty:
         return None, 0, 0
     daily_candidates = daily_candidates.head(3)
@@ -273,6 +286,10 @@ def early_position_pct(
     if args.daily_volume_tiered and pd.notna(daily_volume_ratio20) and float(daily_volume_ratio20) < 0.80:
         pct *= 0.70
         label += "_daily_volume_reduced"
+    dte_factor = float(selected.get("dte_position_factor", 1.0))
+    if dte_factor < 1.0:
+        pct *= dte_factor
+        label += "_edge_dte_reduced"
     return pct, label
 
 
@@ -383,6 +400,8 @@ def build_trade(
         "dte": selected["dte"],
         "delta": selected["delta"],
         "implied_volatility": selected["implied_volatility"],
+        "edge_dte_candidate": bool(selected.get("edge_dte_candidate", False)),
+        "dte_position_factor": float(selected.get("dte_position_factor", 1.0)),
     }
     trade.update(exit_info)
     return trade
@@ -451,6 +470,7 @@ def main() -> None:
             fetch_missing=args.fetch_missing,
             sleep=args.sleep,
             retries=args.retries,
+            allow_edge_dte=args.edge_dte_fallback,
         )
         stats["missing_option_cache"] += missing_cache
         stats["fetched_option_cache"] += fetched_cache

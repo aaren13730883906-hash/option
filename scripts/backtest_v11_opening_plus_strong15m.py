@@ -24,6 +24,28 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=510)
     parser.add_argument("--initial-capital", type=float, default=100000.0)
+    parser.add_argument("--underlying", choices=["588000", "159915"], default="588000")
+    parser.add_argument(
+        "--daily-csv",
+        type=Path,
+        default=ROOT / "data" / "kcb_option_daily.csv",
+    )
+    parser.add_argument(
+        "--market-iv-csv",
+        type=Path,
+        default=ROOT / "data" / "kcb_market_iv_daily.csv",
+    )
+    parser.add_argument(
+        "--etf-daily-csv",
+        type=Path,
+        default=ROOT / "data" / "etf_daily_588000_588080.csv",
+    )
+    parser.add_argument("--range-threshold", type=float, default=0.0030)
+    parser.add_argument("--breakout-vol-mult", type=float, default=1.30)
+    parser.add_argument("--disable-fallback", action="store_true")
+    parser.add_argument("--fallback-position-multiplier", type=float, default=2.5)
+    parser.add_argument("--fallback-position-cap", type=float, default=0.50)
+    parser.add_argument("--edge-dte-fallback", action="store_true")
     parser.add_argument(
         "--output",
         type=Path,
@@ -65,42 +87,68 @@ def main() -> None:
         fallback_pool_summary = temp / "fallback_pool_summary.csv"
         capital_summary = temp / "capital_summary.csv"
 
-        run(
-            [
+        opening_command = [
                 sys.executable,
                 "scripts/backtest_v10_opening_range_b.py",
                 "--days",
                 str(args.days),
+                "--underlying",
+                args.underlying,
+                "--daily-csv",
+                str(args.daily_csv),
+                "--market-iv-csv",
+                str(args.market_iv_csv),
+                "--etf-daily-csv",
+                str(args.etf_daily_csv),
+                "--range-threshold",
+                str(args.range_threshold),
+                "--breakout-vol-mult",
+                str(args.breakout_vol_mult),
                 "--daily-volume-tiered",
                 "--output",
                 str(opening_path),
                 "--summary",
                 str(opening_summary),
             ]
-        )
-        run(
-            [
+        if args.edge_dte_fallback:
+            opening_command.append("--edge-dte-fallback")
+        run(opening_command)
+        if not args.disable_fallback:
+            run(
+                [
                 sys.executable,
                 "scripts/backtest_v02_recent_intraday.py",
                 "--days",
                 str(args.days),
                 "--underlying",
-                "588000",
+                args.underlying,
+                "--daily-csv",
+                str(args.daily_csv),
+                "--market-iv-csv",
+                str(args.market_iv_csv),
+                "--etf-daily-csv",
+                str(args.etf_daily_csv),
                 "--candidate-pool",
                 "3",
                 "--daily-volume-tiered",
+                "--strong-signals-only",
                 "--entry-start-time",
-                "10:00",
+                "09:45",
+                "--execute-0945-at-0946",
+                "--position-multiplier",
+                str(args.fallback_position_multiplier),
+                "--position-cap",
+                str(args.fallback_position_cap),
                 "--no-fetch",
                 "--output",
                 str(fallback_pool_path),
                 "--summary",
                 str(fallback_pool_summary),
-            ]
-        )
+                ]
+            )
 
         opening = read_trades(opening_path)
-        fallback_pool = read_trades(fallback_pool_path)
+        fallback_pool = pd.DataFrame() if args.disable_fallback else read_trades(fallback_pool_path)
         opening_dates = set(opening.get("trade_date", pd.Series(dtype=str)).astype(str))
         if fallback_pool.empty:
             fallback = fallback_pool.copy()

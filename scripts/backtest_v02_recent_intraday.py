@@ -70,6 +70,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reject non-strong ETF bars before contract selection and trade-state updates.",
     )
+    parser.add_argument(
+        "--position-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiply the final risk-adjusted premium position.",
+    )
+    parser.add_argument("--position-cap", type=float, default=1.0)
     parser.add_argument("--output", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_trades.csv")
     parser.add_argument("--summary", type=Path, default=RESEARCH_DIR / "backtest_v05_588000_recent1m_summary.csv")
     return parser.parse_args()
@@ -965,6 +972,10 @@ def main() -> None:
             if direction == "put" and pd.notna(daily_row["daily_ref_lower_shadow_ratio"]) and daily_row["daily_ref_lower_shadow_ratio"] > 0.45:
                 position_pct, signal_strength = reduce_position(position_pct, signal_strength, "lower_shadow")
                 risk_flags.append("lower_shadow")
+            if args.position_multiplier != 1.0:
+                position_pct = min(position_pct * args.position_multiplier, args.position_cap)
+                signal_strength = f"{signal_strength}_position_scaled"
+                risk_flags.append(f"position_{args.position_multiplier:g}x")
             exit_info = simulate_exit(
                 chosen.pop("bars_1m"),
                 day_all_bars,

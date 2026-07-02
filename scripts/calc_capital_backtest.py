@@ -132,12 +132,17 @@ def main() -> None:
     out = pd.DataFrame(rows)
     out.to_csv(args.output, index=False)
     active = out[~out["skipped"].fillna(False)].copy() if not out.empty else out
+    underlying = (
+        ",".join(sorted(active["underlying_code"].dropna().astype(str).unique()))
+        if not active.empty and "underlying_code" in active
+        else ""
+    )
     if not active.empty:
         curve = pd.concat([pd.Series([args.initial_capital]), active["capital_after"]], ignore_index=True)
         drawdown = (curve.cummax() - curve) / curve.cummax()
         summary = {
             "strategy_version": args.strategy_version,
-            "underlying": "588000",
+            "underlying": underlying,
             "initial_capital": args.initial_capital,
             "final_capital": capital,
             "net_pnl": capital - args.initial_capital,
@@ -155,7 +160,7 @@ def main() -> None:
     else:
         summary = {
             "strategy_version": args.strategy_version,
-            "underlying": "588000",
+            "underlying": underlying,
             "initial_capital": args.initial_capital,
             "final_capital": capital,
             "net_pnl": 0.0,
