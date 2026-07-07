@@ -25,7 +25,7 @@ import math
 PAPER_START_DATE = 20260703
 HISTORICAL_PARITY_MODE = False
 HISTORICAL_PARITY_END_DATE = 20260630
-BUILD_ID = "V12_LIVE_SIM_20260703_R1"
+BUILD_ID = "V12_LIVE_SIM_20260703_R19"
 INITIAL_CASH = 100000.0
 FEE_PER_CONTRACT_PER_SIDE = 2.0
 SLIPPAGE_TICK = 0.0001
@@ -34,11 +34,18 @@ CONTRACT_MULTIPLIER_DEFAULT = 10000
 # Native QMT simulated-account orders. Keep disabled until the parity
 # backtest passes and the broker confirms these option passorder parameters.
 QMT_NATIVE_ORDER_ENABLED = True
-QMT_ACCOUNT_ID = ""
+QMT_ACCOUNT_ID = "210400032829"
 QMT_OPTION_ACCOUNT_TYPE = 1101
 QMT_BUY_OPEN_OP = 50
-QMT_SELL_CLOSE_OP = 53
-QMT_MARKET_PRICE_TYPE = 5
+QMT_SELL_CLOSE_OP = 51
+QMT_MARKET_PRICE_TYPE = 11
+QMT_ORDER_CODE_WITH_SUFFIX = True
+QMT_PASSORDER_STYLE = "official9"
+QMT_STRATEGY_NAME = "v12_live_sim"
+QMT_QUICK_TRADE = 1
+QMT_PRICE_TICK = 0.0001
+QMT_BUY_LIMIT_BUFFER = 0.0050
+QMT_SELL_LIMIT_BUFFER = 0.0050
 
 # First-live-day safety controls. Keep these values for the first simulated
 # session. Raising them does not improve signal quality.
@@ -47,17 +54,29 @@ LIVE_MAX_TRADES_PER_DAY = 1
 LIVE_REQUIRE_DAILY_BARS = 21
 LIVE_REQUIRE_OPTION_POOL = True
 LIVE_FAIL_CLOSED = True
+LIVE_WALL_CLOCK_GATE = True
+LIVE_BAR_CAPTURE_SECOND = 55
+LIVE_BAR_MAX_SECONDS_TO_END = 10
+LIVE_15M_SEED_VOLUME_DIVISOR = 100.0
+LIVE_FAST_SKIP_BEFORE_START = True
+LIVE_REQUIRE_LAST_BAR_FOR_ORDER = True
+LIVE_CURRENT_BAR_ONLY = True
+LIVE_MINUTE_MONITOR_ALL_DAY = True
 HEARTBEAT_MINUTES = ["0930", "0945", "1000", "1030", "1100", "1130",
                      "1300", "1330", "1400", "1430", "1455", "1500"]
 
-# One deterministic internal-paper order validates the complete execution
-# state machine even when the strategy has no natural signal in the short
-# current-contract replay window.  It NEVER calls passorder.
+# One explicit live-sim order validates the QMT simulated-account order
+# channel even when the strategy has no natural signal.  This calls passorder
+# when QMT_NATIVE_ORDER_ENABLED is True.  Keep quantity limited by
+# LIVE_MAX_CONTRACTS while testing.
 EXECUTION_SMOKE_TEST = False
-SMOKE_TEST_DATE = 20260617
-SMOKE_TEST_TIME = "0946"
+SMOKE_TEST_ALLOW_ORDERS = True
+SMOKE_TEST_DATE = 0
+SMOKE_TEST_TIME = "0931"
 SMOKE_TEST_UNDERLYING = "588000.SH"
 SMOKE_TEST_DIRECTION = "call"
+SMOKE_TEST_AUTO_CLOSE = True
+SMOKE_TEST_CLOSE_AFTER_MINUTES = 2
 
 # Keep this empty for strategy testing.  Set to "call" or "put" only for a
 # same-day plumbing test when fewer than 21 completed daily bars are loaded.
@@ -113,6 +132,13 @@ HISTORICAL_KCB_IV_REGIME = {
     20260629: (0.7140, 1.0),
     20260630: (0.7090, 0.9901088031651830),
 }
+
+# QMT may invoke handlebar several times for the same forming minute and may
+# not preserve arbitrary ContextInfo attributes between those callbacks.
+# Module-level guards prevent duplicate bar processing and duplicate orders.
+RUNTIME_LAST_PROCESSED_BAR = ""
+RUNTIME_ORDER_KEYS = set()
+RUNTIME_CONTEXT_STATE = None
 
 # Embedded daily warmup through 2026-07-02. This avoids a pandas dependency
 # inside QMT and is refreshed only when a new live build is prepared.
@@ -171,6 +197,63 @@ LIVE_DAILY_SEED = {
         (20260630, 4.224, 4.370, 4.221, 4.364, 1108784875.0, 4776124320.222),
         (20260701, 4.364, 4.378, 4.234, 4.274, 1269215032.0, 5484765907.026),
         (20260702, 4.207, 4.207, 4.016, 4.036, 1876485200.0, 7700524802.000),
+    ],
+}
+
+# The last 24 completed 15-minute bars through 2026-07-02. They warm EMA20
+# and opening confirmation after old minute callbacks are fast-forwarded.
+LIVE_15M_SEED = {
+    "588000.SH": [
+        ("20260701131500", "1315", 2.338, 2.338, 2.286, 2.287, 394167124.0, 911137329.817),
+        ("20260701133000", "1330", 2.286, 2.325, 2.285, 2.293, 231927780.0, 534794640.013),
+        ("20260701134500", "1345", 2.293, 2.306, 2.276, 2.277, 220900500.0, 506275599.060),
+        ("20260701140000", "1400", 2.279, 2.294, 2.264, 2.294, 275984622.0, 628395582.240),
+        ("20260701141500", "1415", 2.293, 2.300, 2.282, 2.282, 124097839.0, 284572166.387),
+        ("20260701143000", "1430", 2.282, 2.282, 2.266, 2.268, 184437636.0, 419197776.421),
+        ("20260701144500", "1445", 2.267, 2.286, 2.252, 2.286, 224569338.0, 509211325.515),
+        ("20260701150000", "1500", 2.285, 2.292, 2.276, 2.290, 190669445.0, 435716307.620),
+        ("20260702094500", "0945", 2.220, 2.220, 2.153, 2.173, 951845690.0, 2079580202.000),
+        ("20260702100000", "1000", 2.173, 2.225, 2.165, 2.210, 460804010.0, 1013531400.000),
+        ("20260702101500", "1015", 2.212, 2.240, 2.209, 2.225, 318896900.0, 710470200.000),
+        ("20260702103000", "1030", 2.225, 2.227, 2.198, 2.202, 227794100.0, 502734300.000),
+        ("20260702104500", "1045", 2.201, 2.230, 2.201, 2.217, 147538600.0, 327436900.000),
+        ("20260702110000", "1100", 2.217, 2.221, 2.196, 2.196, 127008700.0, 280112200.000),
+        ("20260702111500", "1115", 2.196, 2.209, 2.189, 2.208, 117385800.0, 257849800.000),
+        ("20260702113000", "1130", 2.208, 2.214, 2.182, 2.187, 121649400.0, 267538500.000),
+        ("20260702131500", "1315", 2.187, 2.189, 2.173, 2.179, 174044800.0, 379399900.000),
+        ("20260702133000", "1330", 2.179, 2.179, 2.154, 2.154, 297317200.0, 643045300.000),
+        ("20260702134500", "1345", 2.155, 2.157, 2.142, 2.144, 342772500.0, 736926900.000),
+        ("20260702140000", "1400", 2.143, 2.155, 2.134, 2.149, 347003000.0, 744353800.000),
+        ("20260702141500", "1415", 2.148, 2.157, 2.137, 2.144, 225284200.0, 483327000.000),
+        ("20260702143000", "1430", 2.143, 2.144, 2.130, 2.131, 207207900.0, 442360400.000),
+        ("20260702144500", "1445", 2.130, 2.141, 2.106, 2.112, 338607000.0, 718895600.000),
+        ("20260702150000", "1500", 2.113, 2.123, 2.100, 2.119, 445731300.0, 940039800.000),
+    ],
+    "159915.SZ": [
+        ("20260701131500", "1315", 4.340, 4.343, 4.308, 4.308, 71908900.0, 310929863.600),
+        ("20260701133000", "1330", 4.308, 4.341, 4.304, 4.313, 62724455.0, 271128159.795),
+        ("20260701134500", "1345", 4.312, 4.325, 4.284, 4.285, 70957100.0, 305671029.100),
+        ("20260701140000", "1400", 4.286, 4.295, 4.262, 4.282, 95404000.0, 407946006.960),
+        ("20260701141500", "1415", 4.279, 4.298, 4.275, 4.278, 50844200.0, 217860372.237),
+        ("20260701143000", "1430", 4.277, 4.278, 4.252, 4.260, 54415100.0, 232066174.600),
+        ("20260701144500", "1445", 4.261, 4.268, 4.234, 4.262, 72852700.0, 309569112.800),
+        ("20260701150000", "1500", 4.260, 4.283, 4.259, 4.274, 69214363.0, 295442763.532),
+        ("20260702094500", "0945", 4.207, 4.207, 4.101, 4.103, 447165980.0, 1846040102.000),
+        ("20260702100000", "1000", 4.102, 4.157, 4.088, 4.138, 170654690.0, 703966400.000),
+        ("20260702101500", "1015", 4.138, 4.172, 4.138, 4.164, 104740410.0, 435623700.000),
+        ("20260702103000", "1030", 4.165, 4.167, 4.141, 4.156, 79654700.0, 330911000.000),
+        ("20260702104500", "1045", 4.156, 4.185, 4.154, 4.171, 51529300.0, 214915400.000),
+        ("20260702110000", "1100", 4.169, 4.176, 4.134, 4.134, 53423590.0, 222120300.000),
+        ("20260702111500", "1115", 4.133, 4.157, 4.125, 4.157, 50102200.0, 207212600.000),
+        ("20260702113000", "1130", 4.155, 4.166, 4.125, 4.129, 41195300.0, 170599200.000),
+        ("20260702131500", "1315", 4.135, 4.135, 4.111, 4.115, 84323500.0, 347594900.000),
+        ("20260702133000", "1330", 4.115, 4.115, 4.081, 4.083, 126553100.0, 518025600.000),
+        ("20260702134500", "1345", 4.083, 4.084, 4.061, 4.062, 110853010.0, 451350600.000),
+        ("20260702140000", "1400", 4.062, 4.078, 4.048, 4.062, 140404720.0, 570202700.000),
+        ("20260702141500", "1415", 4.062, 4.089, 4.051, 4.072, 89143500.0, 362692300.000),
+        ("20260702143000", "1430", 4.072, 4.073, 4.045, 4.048, 71535300.0, 290189400.000),
+        ("20260702144500", "1445", 4.049, 4.059, 4.026, 4.033, 96113300.0, 388588300.000),
+        ("20260702150000", "1500", 4.032, 4.036, 4.016, 4.036, 159092600.0, 640492300.000),
     ],
 }
 
@@ -429,6 +512,25 @@ def current_datetime(ContextInfo):
         return "ERROR:%s" % repr(exc), 0, ""
 
 
+def live_bar_is_in_future(current_date, time_text):
+    if not LIVE_WALL_CLOCK_GATE:
+        return False
+    wall = datetime.datetime.now()
+    try:
+        bar_end = datetime.datetime.strptime(
+            "%08d%s00" % (current_date, time_text),
+            "%Y%m%d%H%M%S",
+        )
+    except Exception:
+        return True
+    seconds_to_bar_end = (bar_end - wall).total_seconds()
+    if seconds_to_bar_end > LIVE_BAR_MAX_SECONDS_TO_END:
+        return True
+    if seconds_to_bar_end > 0:
+        return wall.second < LIVE_BAR_CAPTURE_SECOND
+    return False
+
+
 def timetag_date(value):
     text = str(value)
     digits = "".join(ch for ch in text if ch.isdigit())
@@ -563,12 +665,59 @@ def log(*items):
     print("[V12_PAPER]", *items)
 
 
-def submit_qmt_order(ContextInfo, side, code, quantity):
+def round_order_price(value):
+    number = safe_float(value)
+    if number is None or number <= 0:
+        return -1
+    ticks = int(number / QMT_PRICE_TICK + 0.5)
+    price = max(ticks * QMT_PRICE_TICK, QMT_PRICE_TICK)
+    return round(price, 4)
+
+
+def qmt_order_price(side, reference_price):
+    reference = safe_float(reference_price)
+    if reference is None or reference <= 0:
+        return -1
+    if side == "buy":
+        return round_order_price(reference + QMT_BUY_LIMIT_BUFFER)
+    return round_order_price(reference - QMT_SELL_LIMIT_BUFFER)
+
+
+def submit_qmt_order(ContextInfo, side, code, quantity, reference_price=None):
+    global RUNTIME_ORDER_KEYS
     if not QMT_NATIVE_ORDER_ENABLED:
         return True
     if not getattr(ContextInfo, "live_orders_allowed", False):
         log("QMT_ORDER_BLOCKED", "preflight_not_ready")
         return False
+    if LIVE_REQUIRE_LAST_BAR_FOR_ORDER:
+        try:
+            is_last = bool(ContextInfo.is_last_bar())
+        except Exception:
+            is_last = False
+        if not is_last:
+            log(
+                "QMT_ORDER_BLOCKED",
+                "not_current_live_bar",
+                side,
+                code,
+            )
+            return False
+    order_bar_text, unused_date, unused_time = current_datetime(ContextInfo)
+    order_key = (
+        str(order_bar_text),
+        str(side),
+        str(code),
+        int(quantity),
+    )
+    if order_key in RUNTIME_ORDER_KEYS:
+        log(
+            "QMT_ORDER_BLOCKED",
+            "duplicate_order_key",
+            repr(order_key),
+        )
+        return False
+    RUNTIME_ORDER_KEYS.add(order_key)
     account_id = getattr(ContextInfo, "live_account_id", QMT_ACCOUNT_ID)
     if not account_id:
         log("QMT_ORDER_BLOCKED", "missing_account_id")
@@ -578,18 +727,88 @@ def submit_qmt_order(ContextInfo, side, code, quantity):
         if side == "buy"
         else QMT_SELL_CLOSE_OP
     )
-    order_code = str(code).split(".")[0]
+    if QMT_ORDER_CODE_WITH_SUFFIX:
+        order_code = str(code)
+    else:
+        order_code = str(code).split(".")[0]
+    order_price = qmt_order_price(side, reference_price)
+    log(
+        "PASSORDER_ARGS",
+        "style=",
+        QMT_PASSORDER_STYLE,
+        "operation=",
+        operation,
+        "account_type=",
+        QMT_OPTION_ACCOUNT_TYPE,
+        "account=",
+        masked_account(account_id),
+        "code=",
+        order_code,
+        "price_type=",
+        QMT_MARKET_PRICE_TYPE,
+        "price=",
+        order_price,
+        "ref_price=",
+        round(reference_price, 6)
+        if reference_price is not None
+        else None,
+        "qty=",
+        int(quantity),
+        "strategy=",
+        QMT_STRATEGY_NAME,
+        "quick=",
+        QMT_QUICK_TRADE,
+        "buy_buffer=",
+        QMT_BUY_LIMIT_BUFFER,
+        "sell_buffer=",
+        QMT_SELL_LIMIT_BUFFER,
+    )
     try:
-        passorder(
-            operation,
-            QMT_OPTION_ACCOUNT_TYPE,
-            account_id,
-            order_code,
-            QMT_MARKET_PRICE_TYPE,
-            -1,
-            int(quantity),
-            ContextInfo,
+        user_order_id = (
+            "v12_%s_%s_%s" % (
+                str(side),
+                str(order_code).replace(".", ""),
+                str(order_bar_text),
+            )
         )
+        if QMT_PASSORDER_STYLE == "official9":
+            result = passorder(
+                operation,
+                QMT_OPTION_ACCOUNT_TYPE,
+                account_id,
+                order_code,
+                QMT_MARKET_PRICE_TYPE,
+                order_price,
+                int(quantity),
+                QMT_QUICK_TRADE,
+                ContextInfo,
+            )
+        elif QMT_PASSORDER_STYLE == "strategy11":
+            result = passorder(
+                operation,
+                QMT_OPTION_ACCOUNT_TYPE,
+                account_id,
+                order_code,
+                QMT_MARKET_PRICE_TYPE,
+                order_price,
+                int(quantity),
+                QMT_STRATEGY_NAME,
+                QMT_QUICK_TRADE,
+                user_order_id,
+                ContextInfo,
+            )
+        else:
+            result = passorder(
+                operation,
+                QMT_OPTION_ACCOUNT_TYPE,
+                account_id,
+                order_code,
+                QMT_MARKET_PRICE_TYPE,
+                order_price,
+                int(quantity),
+                ContextInfo,
+            )
+        log("PASSORDER_RETURN", repr(result))
         log(
             "QMT_ORDER_SENT",
             side,
@@ -695,7 +914,7 @@ def new_underlying_state(code):
         "current_date": 0,
         "day_bars": [],
         "pending15": [],
-        "bars15": [],
+        "bars15": embedded_15m_rows(code),
         "daily": [],
         "pool": {"CALL": [], "PUT": []},
         "option_bars": {},
@@ -704,6 +923,9 @@ def new_underlying_state(code):
         "opening_evaluated": False,
         "opening_trade_entered": False,
         "fallback_pending": None,
+        "fallback_monitor_active": False,
+        "last_iv_market": None,
+        "last_iv_rank": None,
         "last_fallback_signal_time": "",
     }
 
@@ -836,6 +1058,26 @@ def embedded_daily_rows(code):
     return rows
 
 
+def embedded_15m_rows(code):
+    rows = []
+    for values in LIVE_15M_SEED.get(code, []):
+        rows.append(
+            {
+                "datetime": values[0],
+                "time": values[1],
+                "open": values[2],
+                "high": values[3],
+                "low": values[4],
+                "close": values[5],
+                "volume": (
+                    values[6] / LIVE_15M_SEED_VOLUME_DIVISOR
+                ),
+                "amount": values[7],
+            }
+        )
+    return rows
+
+
 def preload_daily_data(ContextInfo, state):
     code = state["code"]
     rows = embedded_daily_rows(code)
@@ -943,6 +1185,9 @@ def reset_for_new_day(state, current_date):
     state["opening_evaluated"] = False
     state["opening_trade_entered"] = False
     state["fallback_pending"] = None
+    state["fallback_monitor_active"] = False
+    state["last_iv_market"] = None
+    state["last_iv_rank"] = None
     state["last_fallback_signal_time"] = ""
 
 
@@ -970,7 +1215,16 @@ def append_15m_if_complete(state, time_text):
     if time_text in ["0930", "1300"]:
         return False
     pending = state.get("pending15", [])
-    if len(pending) < 5:
+    if len(pending) < 14:
+        if pending:
+            log(
+                "BAR15_INCOMPLETE_SKIPPED",
+                state["code"],
+                time_text,
+                "minute_bars=",
+                len(pending),
+            )
+            state["pending15"] = []
         return False
 
     bar15 = {
@@ -1099,6 +1353,7 @@ def build_option_pool(ContextInfo, state, current_date, spot):
             "PUT",
             len(state["pool"]["PUT"]),
         )
+        log_option_pool_detail(code, state["pool"])
         return
     if (
         HISTORICAL_PARITY_MODE
@@ -1150,6 +1405,8 @@ def build_option_pool(ContextInfo, state, current_date, spot):
             {
                 "code": str(option_code),
                 "detail": detail,
+                "open": open_date,
+                "expire": expire_date,
                 "strike": strike,
                 "dte": dte,
                 "rate": rate,
@@ -1179,6 +1436,53 @@ def build_option_pool(ContextInfo, state, current_date, spot):
         "PUT",
         len(state["pool"]["PUT"]),
     )
+    log_option_pool_detail(code, state["pool"])
+
+
+def option_name_from_detail(detail):
+    if not isinstance(detail, dict):
+        return ""
+    for key in [
+        "InstrumentName",
+        "OptName",
+        "Name",
+        "SecurityName",
+        "ContractName",
+    ]:
+        value = detail.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def option_pool_item_text(item):
+    name = option_name_from_detail(item.get("detail", {}))
+    parts = [
+        str(item.get("code", "")),
+        "expire=%s" % str(item.get("expire", "")),
+        "dte=%s" % str(item.get("dte", "")),
+        "strike=%s" % str(item.get("strike", "")),
+    ]
+    if name:
+        parts.append("name=%s" % name)
+    return "|".join(parts)
+
+
+def log_option_pool_detail(underlying, pool):
+    for option_type in ["CALL", "PUT"]:
+        values = pool.get(option_type, [])
+        detail_text = ";".join(
+            [option_pool_item_text(item) for item in values]
+        )
+        log(
+            "POOL_DETAIL",
+            underlying,
+            option_type,
+            "count=",
+            len(values),
+            "contracts=",
+            detail_text,
+        )
 
 
 def update_option_bars(ContextInfo, state, now_text, time_text):
@@ -1680,7 +1984,7 @@ def paper_open(
     target_cost = equity * target_pct
     buy_budget = target_cost * allocation_factor
     multiplier = selected["multiplier"]
-    execution_price = fill_price + SLIPPAGE_TICK
+    execution_price = qmt_order_price("buy", fill_price)
     quantity = int(
         buy_budget / float(execution_price * multiplier)
     )
@@ -1714,6 +2018,7 @@ def paper_open(
         "buy",
         selected["code"],
         quantity,
+        fill_price,
     ):
         log("BUY_ABORTED_ORDER_NOT_SENT", now_text, selected["code"])
         return False
@@ -1791,7 +2096,7 @@ def paper_add_opening(ContextInfo, now_text, fill_price):
         position["first_price"] * OPENING_FIRST_LEG_RATIO
         + fill_price * (1.0 - OPENING_FIRST_LEG_RATIO)
     )
-    weighted_fill = weighted_mid + SLIPPAGE_TICK
+    weighted_fill = qmt_order_price("buy", weighted_mid)
     target_quantity = int(
         position["target_cost"]
         / float(weighted_fill * position["multiplier"])
@@ -1815,6 +2120,7 @@ def paper_add_opening(ContextInfo, now_text, fill_price):
         "buy",
         position["code"],
         quantity,
+        fill_price,
     ):
         log("ADD_ABORTED_ORDER_NOT_SENT", now_text, position["code"])
         position["opening_confirmed"] = True
@@ -1862,10 +2168,11 @@ def paper_sell(ContextInfo, now_text, quantity, fill_price, reason):
         "sell",
         position["code"],
         quantity,
+        fill_price,
     ):
         log("SELL_ABORTED_ORDER_NOT_SENT", now_text, position["code"])
         return
-    execution_price = max(fill_price - SLIPPAGE_TICK, 0.0)
+    execution_price = qmt_order_price("sell", fill_price)
     proceeds = quantity * execution_price * position["multiplier"]
     fee = quantity * FEE_PER_CONTRACT_PER_SIDE
     ContextInfo.paper_cash += proceeds - fee
@@ -2242,6 +2549,8 @@ def live_kcb_iv_regime(ContextInfo, state, spot):
         market_iv - LIVE_IV_ROLLING_MIN
     ) / denominator
     iv_rank = max(0.0, min(1.0, iv_rank))
+    state["last_iv_market"] = market_iv
+    state["last_iv_rank"] = iv_rank
     log(
         "LIVE_IV_REGIME",
         state.get("current_date", 0),
@@ -2291,6 +2600,7 @@ def schedule_kcb_fallback(ContextInfo, now_text):
         return
     signal["daily_info"] = daily_info
     state["fallback_pending"] = signal
+    state["fallback_monitor_active"] = True
     log(
         "FALLBACK_SIGNAL",
         now_text,
@@ -2348,7 +2658,10 @@ def execute_smoke_test(
     if (
         not EXECUTION_SMOKE_TEST
         or ContextInfo.paper_smoke_executed
-        or current_date != SMOKE_TEST_DATE
+        or (
+            SMOKE_TEST_DATE > 0
+            and current_date != SMOKE_TEST_DATE
+        )
         or time_text < SMOKE_TEST_TIME
         or ContextInfo.paper_position is not None
         or ContextInfo.paper_day_locked
@@ -2387,7 +2700,7 @@ def execute_smoke_test(
         selected,
         SMOKE_TEST_UNDERLYING,
         SMOKE_TEST_DIRECTION,
-        "fallback",
+        "smoke_test",
         False,
         daily_info,
         now_text,
@@ -2399,10 +2712,47 @@ def execute_smoke_test(
         log(
             "SMOKE_ORDER_OPENED",
             now_text,
-            "internal_paper_only",
-            "expected_exit_by=",
-            EOD_EXIT_TIME,
+            "qmt_order_channel_test",
+            "auto_close=",
+            SMOKE_TEST_AUTO_CLOSE,
+            "close_after_minutes=",
+            SMOKE_TEST_CLOSE_AFTER_MINUTES,
         )
+
+
+def execute_smoke_auto_close(ContextInfo, now_text):
+    if (
+        not EXECUTION_SMOKE_TEST
+        or not SMOKE_TEST_AUTO_CLOSE
+        or ContextInfo.paper_smoke_close_sent
+    ):
+        return
+    position = ContextInfo.paper_position
+    if position is None or position.get("path") != "smoke_test":
+        return
+    if minutes_since_entry(position, now_text) < SMOKE_TEST_CLOSE_AFTER_MINUTES:
+        return
+    bar = latest_option_bar(ContextInfo, position)
+    if bar is None or bar.get("close") is None or bar.get("close") <= 0:
+        log("SMOKE_AUTO_CLOSE_WAIT_PRICE", now_text, position["code"])
+        return
+    ContextInfo.paper_smoke_close_sent = True
+    log(
+        "SMOKE_AUTO_CLOSE",
+        now_text,
+        position["code"],
+        "qty=",
+        position["quantity"],
+        "close=",
+        round(bar["close"], 6),
+    )
+    paper_sell(
+        ContextInfo,
+        now_text,
+        position["quantity"],
+        bar["close"],
+        "smoke_auto_close",
+    )
 
 
 def resolve_bound_account(ContextInfo):
@@ -2437,7 +2787,7 @@ def run_live_preflight(ContextInfo):
         issues.append("native_order_disabled")
     if not account_id:
         issues.append("missing_account_id")
-    if EXECUTION_SMOKE_TEST:
+    if EXECUTION_SMOKE_TEST and not SMOKE_TEST_ALLOW_ORDERS:
         issues.append("smoke_test_must_be_off")
     if FORCE_TEST_DIRECTION:
         issues.append("forced_direction_must_be_empty")
@@ -2507,7 +2857,531 @@ def print_live_heartbeat(ContextInfo, now_text, time_text):
         )
 
 
+def option_side_snapshot(state, option_type, spot):
+    pool = state["pool"].get(option_type, [])
+    if not pool or spot is None or spot <= 0:
+        return {
+            "priced": 0,
+            "code": "",
+            "close": None,
+            "iv": None,
+            "delta": None,
+            "trend": False,
+        }
+    priced = []
+    for item in pool:
+        bars = state["option_bars"].get(item["code"], [])
+        if bars and bars[-1].get("close", 0) > 0:
+            priced.append((item, bars))
+    if not priced:
+        return {
+            "priced": 0,
+            "code": "",
+            "close": None,
+            "iv": None,
+            "delta": None,
+            "trend": False,
+        }
+    item, bars = min(
+        priced,
+        key=lambda pair: abs(pair[0]["strike"] - spot),
+    )
+    close_value = bars[-1]["close"]
+    iv = implied_volatility(
+        close_value,
+        spot,
+        item["strike"],
+        item["rate"],
+        item["dte"],
+        option_type,
+    )
+    delta = bs_delta(
+        spot,
+        item["strike"],
+        item["rate"],
+        iv,
+        item["dte"],
+        option_type,
+    )
+    trend_ok, unused_strength = option_5m_trend(bars)
+    return {
+        "priced": len(priced),
+        "code": item["code"],
+        "close": close_value,
+        "iv": iv,
+        "delta": delta,
+        "trend": trend_ok,
+    }
+
+
+def print_minute_monitor(ContextInfo, now_text, time_text):
+    opening_window = "0930" <= time_text <= "0945"
+    trading_session = (
+        "0930" <= time_text <= "1130"
+        or "1300" <= time_text <= "1500"
+    )
+    all_day_debug = LIVE_MINUTE_MONITOR_ALL_DAY and trading_session
+    fallback_active = ContextInfo.paper_states[KCB_CODE].get(
+        "fallback_monitor_active",
+        False,
+    )
+    position_active = ContextInfo.paper_position is not None
+    if not (
+        all_day_debug
+        or opening_window
+        or fallback_active
+        or position_active
+    ):
+        return
+
+    reasons = []
+    if all_day_debug:
+        reasons.append("all_day_debug")
+    if opening_window:
+        reasons.append("opening_window")
+    if fallback_active:
+        reasons.append("fallback_triggered")
+    if position_active:
+        reasons.append("position_active")
+    position = ContextInfo.paper_position
+    try:
+        is_current_live_bar = bool(ContextInfo.is_last_bar())
+    except Exception:
+        is_current_live_bar = None
+    log(
+        "MINUTE_MONITOR",
+        now_text,
+        "reason=",
+        ",".join(reasons),
+        "orders_allowed=",
+        getattr(ContextInfo, "live_orders_allowed", False),
+        "position=",
+        position["code"] if position is not None else "NONE",
+        "qty=",
+        position["quantity"] if position is not None else 0,
+        "current_live_bar=",
+        is_current_live_bar,
+    )
+
+    for code in UNDERLYINGS:
+        state = ContextInfo.paper_states[code]
+        bars = state.get("day_bars", [])
+        latest = bars[-1] if bars else {}
+        first5 = [
+            bar
+            for bar in bars
+            if "0930" <= bar.get("time", "") <= "0934"
+        ]
+        opening_high = (
+            max(bar["high"] for bar in first5)
+            if first5
+            else None
+        )
+        opening_low = (
+            min(bar["low"] for bar in first5)
+            if first5
+            else None
+        )
+        opening_amp = (
+            (opening_high - opening_low) / opening_low
+            if opening_low is not None and opening_low > 0
+            else None
+        )
+        daily_info = daily_context(
+            state,
+            latest.get("close"),
+        )
+        log(
+            "MINUTE_DATA",
+            code,
+            "time=",
+            time_text,
+            "close=",
+            round(latest.get("close"), 6)
+            if latest.get("close") is not None
+            else None,
+            "volume=",
+            round(latest.get("volume"), 2)
+            if latest.get("volume") is not None
+            else None,
+            "daily_direction=",
+            daily_info.get("direction", "none"),
+            "opening_bars=",
+            len(first5),
+            "opening_high=",
+            round(opening_high, 6)
+            if opening_high is not None
+            else None,
+            "opening_low=",
+            round(opening_low, 6)
+            if opening_low is not None
+            else None,
+            "opening_amp=",
+            round(opening_amp, 6)
+            if opening_amp is not None
+            else None,
+            "pool_call=",
+            len(state["pool"].get("CALL", [])),
+            "pool_put=",
+            len(state["pool"].get("PUT", [])),
+        )
+
+        direction = daily_info.get("direction", "none")
+        threshold = RANGE_THRESHOLD[code]
+        range_ok = (
+            opening_amp is not None
+            and opening_amp >= threshold
+        )
+        broke = False
+        if latest and opening_high is not None and opening_low is not None:
+            if direction == "call":
+                broke = latest.get("high", 0) > opening_high
+            elif direction == "put":
+                broke = latest.get("low", 0) < opening_low
+        first5_mean_volume = mean(
+            [bar["volume"] for bar in first5]
+        )
+        first5_max_volume = (
+            max(bar["volume"] for bar in first5)
+            if first5
+            else None
+        )
+        volume_ratio = (
+            latest.get("volume") / first5_mean_volume
+            if latest.get("volume") is not None
+            and first5_mean_volume is not None
+            and first5_mean_volume > 0
+            else None
+        )
+        volume_ok = (
+            volume_ratio is not None
+            and volume_ratio >= BREAKOUT_VOLUME_MULT[code]
+            and first5_max_volume is not None
+            and latest.get("volume", 0)
+            >= first5_max_volume * BREAKOUT_VOLUME_MAX_MULT
+        )
+        if time_text > "0943":
+            opening_status = "window_closed"
+        elif direction not in ["call", "put"]:
+            opening_status = "blocked_daily_direction"
+        elif len(first5) < 5:
+            opening_status = "collecting_first5"
+        elif not range_ok:
+            opening_status = "blocked_opening_range"
+        elif not broke:
+            opening_status = "waiting_breakout"
+        elif not volume_ok:
+            opening_status = "blocked_breakout_volume"
+        else:
+            opening_status = "breakout_candidate"
+        log(
+            "OPEN_CHECK",
+            code,
+            "status=",
+            opening_status,
+            "direction=",
+            direction,
+            "range_ok=",
+            range_ok,
+            "range_threshold=",
+            threshold,
+            "breakout=",
+            broke,
+            "volume_ratio=",
+            round(volume_ratio, 4)
+            if volume_ratio is not None
+            else None,
+            "volume_ok=",
+            volume_ok,
+            "signal=",
+            state.get("opening_signal") is not None,
+        )
+
+        spot = latest.get("close")
+        call_scan = option_side_snapshot(state, "CALL", spot)
+        put_scan = option_side_snapshot(state, "PUT", spot)
+        log(
+            "OPTION_SCAN",
+            code,
+            "CALL",
+            call_scan["priced"],
+            call_scan["code"],
+            "close=",
+            round(call_scan["close"], 6)
+            if call_scan["close"] is not None
+            else None,
+            "iv=",
+            round(call_scan["iv"], 4)
+            if call_scan["iv"] is not None
+            else None,
+            "delta=",
+            round(call_scan["delta"], 4)
+            if call_scan["delta"] is not None
+            else None,
+            "trend=",
+            call_scan["trend"],
+            "PUT",
+            put_scan["priced"],
+            put_scan["code"],
+            "close=",
+            round(put_scan["close"], 6)
+            if put_scan["close"] is not None
+            else None,
+            "iv=",
+            round(put_scan["iv"], 4)
+            if put_scan["iv"] is not None
+            else None,
+            "delta=",
+            round(put_scan["delta"], 4)
+            if put_scan["delta"] is not None
+            else None,
+            "trend=",
+            put_scan["trend"],
+        )
+
+    kcb_state = ContextInfo.paper_states[KCB_CODE]
+    kcb_bars = kcb_state.get("day_bars", [])
+    kcb_spot = kcb_bars[-1]["close"] if kcb_bars else None
+    kcb_daily = daily_context(kcb_state, kcb_spot)
+    if kcb_spot is not None and kcb_state.get("pool_ready"):
+        live_kcb_iv_regime(ContextInfo, kcb_state, kcb_spot)
+    bars15 = kcb_state.get("bars15", [])
+    current15 = bars15[-1] if bars15 else None
+    current15_today = (
+        current15 is not None
+        and str(current15.get("datetime", "")).startswith(
+            str(kcb_state.get("current_date", 0))
+        )
+    )
+    fallback_time_ok = (
+        "0945" <= time_text <= "1415"
+        and (time_text <= "1100" or time_text >= "1315")
+    )
+    fallback_volume_ratio = None
+    fallback_breakout_call = False
+    fallback_breakout_put = False
+    fallback_close_pos = None
+    if current15_today and len(bars15) >= 21:
+        previous = bars15[:-1]
+        prev5_volume = mean(
+            [bar["volume"] for bar in previous[-5:]]
+        )
+        if prev5_volume is not None and prev5_volume > 0:
+            fallback_volume_ratio = (
+                current15["volume"] / prev5_volume
+            )
+        prev3_high = max(bar["high"] for bar in previous[-3:])
+        prev3_low = min(bar["low"] for bar in previous[-3:])
+        closes15 = [bar["close"] for bar in bars15]
+        ema5_values = ema_series(closes15, 5)
+        ema20_values = ema_series(closes15, 20)
+        ema20_slope = ema20_values[-1] - ema20_values[-2]
+        bar_range = current15["high"] - current15["low"]
+        fallback_close_pos = (
+            (current15["close"] - current15["low"]) / bar_range
+            if bar_range > 0
+            else 0.5
+        )
+        fallback_breakout_call = (
+            current15["close"] > prev3_high
+            and ema5_values[-1] > ema20_values[-1]
+            and ema20_slope > 0
+            and fallback_close_pos
+            >= (0.75 if current15["time"] == "0945" else 0.65)
+        )
+        fallback_breakout_put = (
+            current15["close"] < prev3_low
+            and ema5_values[-1] < ema20_values[-1]
+            and ema20_slope < 0
+            and fallback_close_pos
+            <= (0.25 if current15["time"] == "0945" else 0.35)
+        )
+    cluster_ok = kcb_daily.get("cluster", 0.0) >= 0.015
+    daily_volume_ratio = kcb_daily.get("volume_ratio20")
+    daily_volume_ok = (
+        daily_volume_ratio is not None
+        and daily_volume_ratio >= 0.65
+    )
+    fallback_volume_ok = (
+        fallback_volume_ratio is not None
+        and fallback_volume_ratio >= 2.0
+    )
+    iv_market = kcb_state.get("last_iv_market")
+    iv_rank = kcb_state.get("last_iv_rank")
+    iv_ok = (
+        iv_market is not None
+        and iv_market >= IV_MIN
+        and iv_rank is not None
+        and iv_rank < FALLBACK_IV_RANK_MAX
+    )
+    fallback_direction = kcb_daily.get("direction", "none")
+    direction_signal = (
+        "call"
+        if fallback_breakout_call
+        else "put"
+        if fallback_breakout_put
+        else "none"
+    )
+    if not fallback_time_ok:
+        fallback_status = "outside_time_window"
+    elif not current15_today:
+        fallback_status = "waiting_today_15m_bar"
+    elif not cluster_ok:
+        fallback_status = "blocked_ma_cluster"
+    elif not daily_volume_ok:
+        fallback_status = "blocked_daily_volume"
+    elif not fallback_volume_ok:
+        fallback_status = "blocked_15m_volume"
+    elif direction_signal == "none":
+        fallback_status = "waiting_15m_breakout"
+    elif direction_signal != fallback_direction:
+        fallback_status = "blocked_direction_mismatch"
+    elif not iv_ok:
+        fallback_status = "blocked_iv_regime"
+    else:
+        fallback_status = "fallback_candidate"
+    log(
+        "FALLBACK_CHECK",
+        KCB_CODE,
+        "status=",
+        fallback_status,
+        "time_ok=",
+        fallback_time_ok,
+        "bars15=",
+        len(bars15),
+        "daily_direction=",
+        fallback_direction,
+        "cluster=",
+        round(kcb_daily.get("cluster"), 6)
+        if kcb_daily.get("cluster") is not None
+        else None,
+        "cluster_ok=",
+        cluster_ok,
+        "daily_volume_ratio=",
+        round(daily_volume_ratio, 4)
+        if daily_volume_ratio is not None
+        else None,
+        "volume15_ratio=",
+        round(fallback_volume_ratio, 4)
+        if fallback_volume_ratio is not None
+        else None,
+        "direction_signal=",
+        direction_signal,
+        "close_pos=",
+        round(fallback_close_pos, 4)
+        if fallback_close_pos is not None
+        else None,
+        "market_iv_proxy=",
+        round(iv_market, 4) if iv_market is not None else None,
+        "iv_rank_proxy=",
+        round(iv_rank, 4) if iv_rank is not None else None,
+        "iv_ok=",
+        iv_ok,
+        "pending=",
+        kcb_state.get("fallback_pending") is not None,
+    )
+
+    position = ContextInfo.paper_position
+    if position is None:
+        log(
+            "POSITION_MARK",
+            "NONE",
+            "cash=",
+            round(ContextInfo.paper_cash, 2),
+            "equity=",
+            round(paper_equity(ContextInfo), 2),
+            "closed_trades=",
+            ContextInfo.paper_trade_count,
+        )
+    else:
+        position_state = ContextInfo.paper_states[
+            position["underlying"]
+        ]
+        position_bars = position_state["option_bars"].get(
+            position["code"],
+            [],
+        )
+        mark = (
+            position_bars[-1]["close"]
+            if position_bars
+            else position["avg_fill_price"]
+        )
+        gross_pnl = (
+            mark - position["avg_fill_price"]
+        ) * position["quantity"] * position["multiplier"]
+        return_pct = (
+            mark / position["avg_fill_price"] - 1.0
+            if position["avg_fill_price"] > 0
+            else 0.0
+        )
+        log(
+            "POSITION_MARK",
+            position["code"],
+            "path=",
+            position["path"],
+            "qty=",
+            position["quantity"],
+            "avg_fill=",
+            round(position["avg_fill_price"], 6),
+            "mark=",
+            round(mark, 6),
+            "gross_pnl=",
+            round(gross_pnl, 2),
+            "return_pct=",
+            round(return_pct, 6),
+            "equity=",
+            round(paper_equity(ContextInfo), 2),
+        )
+
+
+def runtime_state_fields():
+    return [
+        "paper_states",
+        "paper_cash",
+        "paper_position",
+        "paper_trade_count",
+        "paper_day_entries",
+        "paper_current_date",
+        "paper_day_locked",
+        "paper_opening_evaluated",
+        "paper_smoke_executed",
+        "paper_parity_end_logged",
+        "paper_last_bar_text",
+        "paper_smoke_close_sent",
+        "live_future_bar_logged",
+        "live_history_skip_logged",
+        "live_current_bar_logged",
+        "live_account_id",
+        "live_orders_allowed",
+    ]
+
+
+def save_runtime_context(ContextInfo):
+    global RUNTIME_CONTEXT_STATE
+    state = {}
+    for name in runtime_state_fields():
+        state[name] = getattr(ContextInfo, name, None)
+    RUNTIME_CONTEXT_STATE = state
+
+
+def load_runtime_context(ContextInfo):
+    if RUNTIME_CONTEXT_STATE is None:
+        return
+    for name in runtime_state_fields():
+        setattr(
+            ContextInfo,
+            name,
+            RUNTIME_CONTEXT_STATE.get(name),
+        )
+
+
 def init(ContextInfo):
+    global RUNTIME_LAST_PROCESSED_BAR
+    global RUNTIME_ORDER_KEYS
+    global RUNTIME_CONTEXT_STATE
+    RUNTIME_LAST_PROCESSED_BAR = ""
+    RUNTIME_ORDER_KEYS = set()
+    RUNTIME_CONTEXT_STATE = None
     ContextInfo.paper_states = dict(
         (code, new_underlying_state(code))
         for code in UNDERLYINGS
@@ -2520,11 +3394,21 @@ def init(ContextInfo):
     ContextInfo.paper_day_locked = False
     ContextInfo.paper_opening_evaluated = False
     ContextInfo.paper_smoke_executed = False
+    ContextInfo.paper_smoke_close_sent = False
     ContextInfo.paper_parity_end_logged = False
+    ContextInfo.live_future_bar_logged = ""
+    ContextInfo.live_history_skip_logged = False
+    ContextInfo.live_current_bar_logged = False
     ContextInfo.paper_last_bar_text = ""
     ContextInfo.set_universe(UNDERLYINGS)
     for code in UNDERLYINGS:
         preload_daily_data(ContextInfo, ContextInfo.paper_states[code])
+        log(
+            "BAR15_SEED_LOADED",
+            code,
+            "bars=",
+            len(ContextInfo.paper_states[code]["bars15"]),
+        )
     run_live_preflight(ContextInfo)
     log("BUILD_ID", BUILD_ID)
     log("INIT", "period=", getattr(ContextInfo, "period", None))
@@ -2540,6 +3424,16 @@ def init(ContextInfo):
         "account_configured=",
         bool(ContextInfo.live_account_id),
     )
+    log(
+        "QMT_PASSORDER_STYLE",
+        QMT_PASSORDER_STYLE,
+        "code_with_suffix=",
+        QMT_ORDER_CODE_WITH_SUFFIX,
+        "strategy=",
+        QMT_STRATEGY_NAME,
+        "quick=",
+        QMT_QUICK_TRADE,
+    )
     log("INITIAL_CASH", INITIAL_CASH)
     log("PAPER_START_DATE", PAPER_START_DATE)
     log(
@@ -2550,6 +3444,21 @@ def init(ContextInfo):
         "time=",
         SMOKE_TEST_TIME,
     )
+    if EXECUTION_SMOKE_TEST:
+        log(
+            "SMOKE_TEST_MODE",
+            "qmt_passorder_channel",
+            "allow_orders=",
+            SMOKE_TEST_ALLOW_ORDERS,
+            "underlying=",
+            SMOKE_TEST_UNDERLYING,
+            "direction=",
+            SMOKE_TEST_DIRECTION,
+            "auto_close=",
+            SMOKE_TEST_AUTO_CLOSE,
+            "close_after_minutes=",
+            SMOKE_TEST_CLOSE_AFTER_MINUTES,
+        )
     log("REQUIRES_1M_CHART")
     log("DAILY_WARMUP", "embedded_through_20260702")
     log(
@@ -2566,15 +3475,47 @@ def init(ContextInfo):
     log("ORDER_STATE", "shadow_fill_assumption_verify_callbacks")
     if FORCE_TEST_DIRECTION:
         log("WARNING_FORCE_TEST_DIRECTION", FORCE_TEST_DIRECTION)
+    save_runtime_context(ContextInfo)
 
 
 def handlebar(ContextInfo):
+    global RUNTIME_LAST_PROCESSED_BAR
+    load_runtime_context(ContextInfo)
+    if LIVE_CURRENT_BAR_ONLY:
+        try:
+            if not bool(ContextInfo.is_last_bar()):
+                return
+        except Exception:
+            pass
     now_text, current_date, time_text = current_datetime(ContextInfo)
     if current_date <= 0 or len(time_text) != 4:
         return
+    if live_bar_is_in_future(current_date, time_text):
+        return
+    if (
+        LIVE_FAST_SKIP_BEFORE_START
+        and not HISTORICAL_PARITY_MODE
+        and current_date < PAPER_START_DATE
+    ):
+        if not ContextInfo.live_history_skip_logged:
+            ContextInfo.live_history_skip_logged = True
+            log(
+                "LIVE_FAST_FORWARD",
+                "skip_before=",
+                PAPER_START_DATE,
+                "first_skipped_bar=",
+                now_text,
+            )
+        return
+    if now_text == RUNTIME_LAST_PROCESSED_BAR:
+        return
+    RUNTIME_LAST_PROCESSED_BAR = now_text
     if now_text == ContextInfo.paper_last_bar_text:
         return
     ContextInfo.paper_last_bar_text = now_text
+    if not ContextInfo.live_current_bar_logged:
+        ContextInfo.live_current_bar_logged = True
+        log("LIVE_CURRENT_BAR_REACHED", now_text)
     if (
         HISTORICAL_PARITY_MODE
         and current_date > HISTORICAL_PARITY_END_DATE
@@ -2693,8 +3634,11 @@ def handlebar(ContextInfo):
     if completed_15m.get(KCB_CODE):
         schedule_kcb_fallback(ContextInfo, now_text)
 
+    execute_smoke_auto_close(ContextInfo, now_text)
+
     manage_position(ContextInfo, now_text, time_text)
 
+    print_minute_monitor(ContextInfo, now_text, time_text)
     print_live_heartbeat(ContextInfo, now_text, time_text)
 
     if time_text == "1500":
@@ -2708,3 +3652,4 @@ def handlebar(ContextInfo):
             "trades=",
             ContextInfo.paper_trade_count,
         )
+    save_runtime_context(ContextInfo)
