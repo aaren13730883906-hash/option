@@ -25,7 +25,7 @@ For the first session, keep:
 The startup log must contain:
 
 ```text
-[V12_PAPER] BUILD_ID V12_LIVE_SIM_20260703_R1
+[V12_PAPER] BUILD_ID V12_LIVE_SIM_20260703_R12
 [V12_PAPER] LIVE_PREFLIGHT ready= True
 [V12_PAPER] MODE QMT_NATIVE_SIM
 [V12_PAPER] PAPER_START_DATE 20260703
@@ -37,6 +37,11 @@ not send orders.
 ## Logs during the session
 
 - `HEARTBEAT`: strategy event loop is alive.
+- `MINUTE_MONITOR` / `MINUTE_DATA`: printed every trading minute.
+- `OPEN_CHECK`: opening-rule pass/block status for both underlyings.
+- `OPTION_SCAN`: current tracked CALL/PUT prices, IV, delta, and trend.
+- `FALLBACK_CHECK`: KCB fallback-rule pass/block status.
+- `POSITION_MARK`: current shadow mark, return, PnL, and equity.
 - `HEARTBEAT_DATA`: ETF bars, daily warmup, option pool, and option bars.
 - `POOL_READY`: current option directory and details are available.
 - `NO_DUAL_OPENING_SIGNAL`: the strategy ran normally but found no opening.

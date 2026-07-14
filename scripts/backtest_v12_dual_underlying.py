@@ -105,6 +105,10 @@ def main() -> None:
     cyb = pd.read_csv(args.cyb_trades)
     kcb = kcb[kcb["trade_date"].astype(str).between(args.start_date, args.end_date)].copy()
     cyb = cyb[cyb["trade_date"].astype(str).between(args.start_date, args.end_date)].copy()
+    if "strategy_leg" not in kcb.columns:
+        kcb["strategy_leg"] = "opening_primary"
+    if "strategy_leg" not in cyb.columns:
+        cyb["strategy_leg"] = "opening_primary"
     kcb["strategy_source"] = "588000_v1.1"
     cyb["strategy_source"] = "159915_v1.1"
     trades = pd.concat([kcb, cyb], ignore_index=True, sort=False)

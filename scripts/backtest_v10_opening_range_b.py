@@ -41,6 +41,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-pool", type=int, default=8)
     parser.add_argument("--strong-trailing-pct", type=float, default=0.25)
     parser.add_argument("--range-threshold", type=float, default=0.003)
+    parser.add_argument(
+        "--put-range-threshold",
+        type=float,
+        default=None,
+        help="Independent Put opening-range threshold; defaults to --range-threshold.",
+    )
+    parser.add_argument(
+        "--warmup-trading-days",
+        type=int,
+        default=20,
+        help="ETF trading days loaded before the tradable start for 15m EMA warmup.",
+    )
     parser.add_argument("--breakout-vol-mult", type=float, default=1.3)
     parser.add_argument("--breakout-volmax-mult", type=float, default=0.8)
     parser.add_argument("--first-leg-ratio", type=float, default=0.65)
@@ -71,13 +83,20 @@ def load_etf_1m(root: Path, trade_date: str, underlying: str) -> pd.DataFrame:
     ymd = trade_date.replace("-", "")
     zip_path = root / ym / f"{ymd}_1min.zip"
     member = f"{bt.market_symbol(underlying)}.csv"
-    if not zip_path.exists():
-        return pd.DataFrame()
-    with zipfile.ZipFile(zip_path) as zf:
-        if member not in zf.namelist():
+    if zip_path.exists():
+        with zipfile.ZipFile(zip_path) as zf:
+            if member in zf.namelist():
+                with zf.open(member) as fh:
+                    raw = pd.read_csv(fh, encoding="utf-8-sig")
+            else:
+                raw = pd.DataFrame()
+    else:
+        raw = pd.DataFrame()
+    if raw.empty:
+        supplemental = bt.ETF_INTRADAY_IFIND / f"{trade_date}_{underlying}_1m.csv"
+        if not supplemental.exists():
             return pd.DataFrame()
-        with zf.open(member) as fh:
-            raw = pd.read_csv(fh, encoding="utf-8-sig")
+        raw = pd.read_csv(supplemental)
     raw = raw.rename(
         columns={
             "时间": "datetime",
@@ -110,7 +129,12 @@ def find_opening_breakout(etf1: pd.DataFrame, daily_direction: str, args: argpar
     h = float(first5["high"].max())
     l = float(first5["low"].min())
     opening_amp = (h - l) / l if l > 0 else math.nan
-    if not pd.notna(opening_amp) or opening_amp < args.range_threshold:
+    range_threshold = (
+        args.put_range_threshold
+        if daily_direction == "put" and args.put_range_threshold is not None
+        else args.range_threshold
+    )
+    if not pd.notna(opening_amp) or opening_amp < range_threshold:
         return None
     if daily_direction not in {"call", "put"}:
         return None
@@ -409,6 +433,10 @@ def build_trade(
 
 def main() -> None:
     args = parse_args()
+    if args.range_threshold <= 0:
+        raise ValueError("range-threshold must be positive")
+    if args.put_range_threshold is not None and args.put_range_threshold <= 0:
+        raise ValueError("put-range-threshold must be positive")
     bt.ensure_dirs()
     RESEARCH_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -420,7 +448,24 @@ def main() -> None:
     daily = daily[daily["underlying_code"] == args.underlying].copy()
     market_iv = market_iv[(market_iv["trade_date"] >= start.strftime("%Y-%m-%d")) & (market_iv["trade_date"] <= end.strftime("%Y-%m-%d"))]
     daily_direction = bt.load_daily_direction(args.underlying, args.etf_daily_csv)
-    etf15 = bt.load_etf_15m(args.sqlite, [args.underlying], start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    direction_dates = pd.to_datetime(daily_direction["trade_date"])
+    prior_dates = direction_dates[direction_dates < start].drop_duplicates().sort_values()
+    if args.warmup_trading_days < 20:
+        raise ValueError("warmup-trading-days must be at least 20")
+    if len(prior_dates) < args.warmup_trading_days:
+        raise RuntimeError(
+            "Insufficient ETF history for {} opening EMA warmup trading days before {}".format(
+                args.warmup_trading_days,
+                start.strftime("%Y-%m-%d"),
+            )
+        )
+    indicator_start = prior_dates.iloc[-args.warmup_trading_days]
+    etf15 = bt.load_etf_15m(
+        args.sqlite,
+        [args.underlying],
+        indicator_start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
     headers = None
     if args.fetch_missing:
         token = bt.get_access_token()
@@ -492,6 +537,13 @@ def main() -> None:
         "start": start.strftime("%Y-%m-%d"),
         "end": end.strftime("%Y-%m-%d"),
         "trades": int(len(out)),
+        "call_range_threshold": args.range_threshold,
+        "put_range_threshold": (
+            args.put_range_threshold
+            if args.put_range_threshold is not None
+            else args.range_threshold
+        ),
+        "warmup_trading_days": args.warmup_trading_days,
         **stats,
     }
     pd.DataFrame([summary]).to_csv(args.summary, index=False)

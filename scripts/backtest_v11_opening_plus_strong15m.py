@@ -41,10 +41,19 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "data" / "etf_daily_588000_588080.csv",
     )
     parser.add_argument("--range-threshold", type=float, default=0.0030)
+    parser.add_argument("--put-range-threshold", type=float, default=None)
     parser.add_argument("--breakout-vol-mult", type=float, default=1.30)
     parser.add_argument("--disable-fallback", action="store_true")
     parser.add_argument("--fallback-position-multiplier", type=float, default=2.5)
     parser.add_argument("--fallback-position-cap", type=float, default=0.50)
+    parser.add_argument("--fallback-progress-min", type=float, default=1.15)
+    parser.add_argument("--warmup-trading-days", type=int, default=20)
+    parser.add_argument("--late-trend-acceleration", action="store_true")
+    parser.add_argument("--late-strong-volume-mult", type=float, default=1.8)
+    parser.add_argument("--high-iv-crash-put", action="store_true")
+    parser.add_argument("--high-iv-put-min", type=float, default=0.70)
+    parser.add_argument("--high-iv-put-max", type=float, default=0.90)
+    parser.add_argument("--high-iv-put-position-cap", type=float, default=0.25)
     parser.add_argument("--edge-dte-fallback", action="store_true")
     parser.add_argument(
         "--output",
@@ -102,6 +111,8 @@ def main() -> None:
                 str(args.etf_daily_csv),
                 "--range-threshold",
                 str(args.range_threshold),
+                "--warmup-trading-days",
+                str(args.warmup_trading_days),
                 "--breakout-vol-mult",
                 str(args.breakout_vol_mult),
                 "--daily-volume-tiered",
@@ -110,12 +121,13 @@ def main() -> None:
                 "--summary",
                 str(opening_summary),
             ]
+        if args.put_range_threshold is not None:
+            opening_command.extend(["--put-range-threshold", str(args.put_range_threshold)])
         if args.edge_dte_fallback:
             opening_command.append("--edge-dte-fallback")
         run(opening_command)
         if not args.disable_fallback:
-            run(
-                [
+            fallback_command = [
                 sys.executable,
                 "scripts/backtest_v02_recent_intraday.py",
                 "--days",
@@ -139,13 +151,33 @@ def main() -> None:
                 str(args.fallback_position_multiplier),
                 "--position-cap",
                 str(args.fallback_position_cap),
+                "--fallback-progress-min",
+                str(args.fallback_progress_min),
+                "--warmup-trading-days",
+                str(args.warmup_trading_days),
                 "--no-fetch",
                 "--output",
                 str(fallback_pool_path),
                 "--summary",
                 str(fallback_pool_summary),
-                ]
-            )
+            ]
+            if args.late_trend_acceleration:
+                fallback_command.extend(
+                    ["--late-trend-acceleration", "--late-strong-volume-mult", str(args.late_strong_volume_mult)]
+                )
+            if args.high_iv_crash_put:
+                fallback_command.extend(
+                    [
+                        "--high-iv-crash-put",
+                        "--high-iv-put-min",
+                        str(args.high_iv_put_min),
+                        "--high-iv-put-max",
+                        str(args.high_iv_put_max),
+                        "--high-iv-put-position-cap",
+                        str(args.high_iv_put_position_cap),
+                    ]
+                )
+            run(fallback_command)
 
         opening = read_trades(opening_path)
         fallback_pool = pd.DataFrame() if args.disable_fallback else read_trades(fallback_pool_path)
@@ -196,6 +228,16 @@ def main() -> None:
             ).sum()
         )
         summary["fallback_trades"] = len(fallback)
+        summary["fallback_progress_min"] = args.fallback_progress_min
+        summary["warmup_trading_days"] = args.warmup_trading_days
+        summary["put_range_threshold"] = (
+            args.put_range_threshold if args.put_range_threshold is not None else args.range_threshold
+        )
+        summary["late_trend_acceleration"] = args.late_trend_acceleration
+        summary["late_strong_volume_mult"] = args.late_strong_volume_mult
+        summary["high_iv_crash_put"] = args.high_iv_crash_put
+        summary["high_iv_put_range"] = "{}-{}".format(args.high_iv_put_min, args.high_iv_put_max)
+        summary["high_iv_put_position_cap"] = args.high_iv_put_position_cap
         summary["data_mode"] = "local_cache_only"
         summary.to_csv(args.summary, index=False)
         print(summary.to_string(index=False))

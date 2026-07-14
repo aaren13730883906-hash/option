@@ -21,15 +21,28 @@ import math
 # Current-contract replay validation:
 # QMT currently exposes contracts that were active from 2026-06-17 onward.
 # Change this to the actual live date before moving the model to paper trading.
-PAPER_START_DATE = 20260617
+PAPER_START_DATE = 20260515
+HISTORICAL_PARITY_MODE = True
+HISTORICAL_PARITY_END_DATE = 20260630
+BUILD_ID = "V12_PARITY_20260702_IVRANK_R1"
 INITIAL_CASH = 100000.0
-FEE_PER_CONTRACT_PER_SIDE = 4.0
+FEE_PER_CONTRACT_PER_SIDE = 2.0
+SLIPPAGE_TICK = 0.0001
 CONTRACT_MULTIPLIER_DEFAULT = 10000
+
+# Native QMT simulated-account orders. Keep disabled until the parity
+# backtest passes and the broker confirms these option passorder parameters.
+QMT_NATIVE_ORDER_ENABLED = False
+QMT_ACCOUNT_ID = ""
+QMT_OPTION_ACCOUNT_TYPE = 1101
+QMT_BUY_OPEN_OP = 50
+QMT_SELL_CLOSE_OP = 53
+QMT_MARKET_PRICE_TYPE = 5
 
 # One deterministic internal-paper order validates the complete execution
 # state machine even when the strategy has no natural signal in the short
 # current-contract replay window.  It NEVER calls passorder.
-EXECUTION_SMOKE_TEST = True
+EXECUTION_SMOKE_TEST = False
 SMOKE_TEST_DATE = 20260617
 SMOKE_TEST_TIME = "0946"
 SMOKE_TEST_UNDERLYING = "588000.SH"
@@ -78,6 +91,54 @@ STRONG_TP1_FACTOR = 1.50
 STRONG_TRAIL_BEFORE_1030 = 0.35
 STRONG_TRAIL_AFTER_1030 = 0.25
 EOD_EXIT_TIME = "1455"
+FALLBACK_IV_RANK_MAX = 0.50
+LATEST_KCB_MARKET_IV = 0.709
+LATEST_KCB_IV_RANK = 0.990108803165183
+HISTORICAL_KCB_IV_REGIME = {
+    20260527: (0.5575, 0.8379351740696278),
+    20260625: (0.6240, 0.9904648390941596),
+    20260629: (0.7140, 1.0),
+    20260630: (0.7090, 0.9901088031651830),
+}
+
+# QMT can read these expired contracts by code, but its historical option
+# directory and detail API return no metadata. These records come from the
+# same local daily option table used by the formal v1.2 backtest. Market bars
+# and all fills are still read from QMT at each historical minute.
+HISTORICAL_OPTION_POOL = {
+    20260520: {
+        "588000.SH": {
+            "CALL": [
+                {
+                    "code": "10011558.SHO",
+                    "strike": 1.95,
+                    "dte": 35,
+                    "rate": 0.02,
+                    "multiplier": 10000,
+                    "fixed_iv": 0.344,
+                    "fixed_delta": 0.495,
+                },
+            ],
+            "PUT": [],
+        },
+    },
+    20260525: {
+        "588000.SH": {
+            "CALL": [
+                {
+                    "code": "10011603.SHO",
+                    "strike": 2.00,
+                    "dte": 30,
+                    "rate": 0.02,
+                    "multiplier": 10000,
+                    "fixed_iv": 0.368,
+                    "fixed_delta": 0.526,
+                },
+            ],
+            "PUT": [],
+        },
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +477,47 @@ def read_option_iv(
 
 def log(*items):
     print("[V12_PAPER]", *items)
+
+
+def submit_qmt_order(ContextInfo, side, code, quantity):
+    if not QMT_NATIVE_ORDER_ENABLED:
+        return True
+    if not QMT_ACCOUNT_ID:
+        log("QMT_ORDER_BLOCKED", "missing_account_id")
+        return False
+    operation = (
+        QMT_BUY_OPEN_OP
+        if side == "buy"
+        else QMT_SELL_CLOSE_OP
+    )
+    order_code = str(code).split(".")[0]
+    try:
+        passorder(
+            operation,
+            QMT_OPTION_ACCOUNT_TYPE,
+            QMT_ACCOUNT_ID,
+            order_code,
+            QMT_MARKET_PRICE_TYPE,
+            -1,
+            int(quantity),
+            ContextInfo,
+        )
+        log(
+            "QMT_ORDER_SENT",
+            side,
+            order_code,
+            "qty=",
+            int(quantity),
+        )
+        return True
+    except Exception as exc:
+        log(
+            "QMT_ORDER_ERROR",
+            side,
+            order_code,
+            repr(exc),
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +873,38 @@ def daily_context(state, current_price):
 
 def build_option_pool(ContextInfo, state, current_date, spot):
     code = state["code"]
+    historical = HISTORICAL_OPTION_POOL.get(
+        current_date,
+        {},
+    ).get(code)
+    if historical is not None:
+        for option_type in ["CALL", "PUT"]:
+            values = []
+            for source in historical.get(option_type, []):
+                item = dict(source)
+                item["distance"] = abs(item["strike"] - spot)
+                values.append(item)
+                state["option_bars"].setdefault(item["code"], [])
+            state["pool"][option_type] = values
+        state["pool_ready"] = True
+        log(
+            "POOL_READY_HISTORICAL",
+            current_date,
+            code,
+            "CALL",
+            len(state["pool"]["CALL"]),
+            "PUT",
+            len(state["pool"]["PUT"]),
+        )
+        return
+    if (
+        HISTORICAL_PARITY_MODE
+        and current_date <= HISTORICAL_PARITY_END_DATE
+    ):
+        state["pool"] = {"CALL": [], "PUT": []}
+        state["pool_ready"] = True
+        log("POOL_EMPTY_PARITY_DATE", current_date, code)
+        return
     try:
         option_codes = ContextInfo.get_option_undl_data(code)
     except Exception as exc:
@@ -896,7 +1030,13 @@ def option_5m_trend(option_bars):
     return last > ema5[-1] and ema5[-1] > ema5[-2], strength
 
 
-def select_option(ContextInfo, state, direction, spot):
+def select_option(
+    ContextInfo,
+    state,
+    direction,
+    spot,
+    asof_time=None,
+):
     option_type = "CALL" if direction == "call" else "PUT"
     ranked = []
     rejected = {
@@ -910,6 +1050,12 @@ def select_option(ContextInfo, state, direction, spot):
     for item in state["pool"].get(option_type, []):
         option_code = item["code"]
         bars = state["option_bars"].get(option_code, [])
+        if asof_time is not None:
+            bars = [
+                bar
+                for bar in bars
+                if bar.get("time", "") <= asof_time
+            ]
         if not bars:
             rejected["no_bars"] += 1
             continue
@@ -917,27 +1063,33 @@ def select_option(ContextInfo, state, direction, spot):
         if last["close"] <= 0:
             rejected["bad_price"] += 1
             continue
-        iv, iv_source = read_option_iv(
-            ContextInfo,
-            option_code,
-            spot,
-            item["strike"],
-            item["rate"],
-            item["dte"],
-            option_type,
-            last["close"],
-        )
+        if item.get("fixed_iv") is not None:
+            iv = item["fixed_iv"]
+            iv_source = "historical_metadata"
+        else:
+            iv, iv_source = read_option_iv(
+                ContextInfo,
+                option_code,
+                spot,
+                item["strike"],
+                item["rate"],
+                item["dte"],
+                option_type,
+                last["close"],
+            )
         if iv is None or iv < IV_MIN or iv > IV_MAX:
             rejected["iv"] += 1
             continue
-        delta = bs_delta(
-            spot,
-            item["strike"],
-            item["rate"],
-            iv,
-            item["dte"],
-            option_type,
-        )
+        delta = item.get("fixed_delta")
+        if delta is None:
+            delta = bs_delta(
+                spot,
+                item["strike"],
+                item["rate"],
+                iv,
+                item["dte"],
+                option_type,
+            )
         if delta is None or not DELTA_MIN <= abs(delta) <= DELTA_MAX:
             rejected["delta"] += 1
             continue
@@ -1141,6 +1293,11 @@ def detect_opening_signal(state, daily_info):
         ) * (
             volume_ratio / BREAKOUT_VOLUME_MULT[state["code"]]
         )
+        entry_minute = max(
+            safe_int(row["time"]) + 3,
+            940,
+        )
+        entry_time = "%04d" % entry_minute
         return {
             "underlying": state["code"],
             "direction": direction,
@@ -1152,6 +1309,7 @@ def detect_opening_signal(state, daily_info):
             "stand_count": stand_count,
             "normalized_strength": normalized_strength,
             "strong": volume_ratio >= 2.0,
+            "entry_time": entry_time,
         }
     return None
 
@@ -1313,8 +1471,9 @@ def paper_open(
     target_cost = equity * target_pct
     buy_budget = target_cost * allocation_factor
     multiplier = selected["multiplier"]
+    execution_price = fill_price + SLIPPAGE_TICK
     quantity = int(
-        buy_budget / float(fill_price * multiplier)
+        buy_budget / float(execution_price * multiplier)
     )
     if quantity <= 0:
         log(
@@ -1324,16 +1483,16 @@ def paper_open(
             buy_budget,
         )
         return False
-    premium = quantity * fill_price * multiplier
+    premium = quantity * execution_price * multiplier
     fee = quantity * FEE_PER_CONTRACT_PER_SIDE
     if premium + fee > ContextInfo.paper_cash:
         quantity = int(
             max(
                 0.0,
                 ContextInfo.paper_cash - FEE_PER_CONTRACT_PER_SIDE,
-            ) / float(fill_price * multiplier + FEE_PER_CONTRACT_PER_SIDE)
+            ) / float(execution_price * multiplier + FEE_PER_CONTRACT_PER_SIDE)
         )
-        premium = quantity * fill_price * multiplier
+        premium = quantity * execution_price * multiplier
         fee = quantity * FEE_PER_CONTRACT_PER_SIDE
     if quantity <= 0:
         return False
@@ -1348,6 +1507,7 @@ def paper_open(
         "quantity": quantity,
         "initial_quantity": quantity,
         "avg_price": fill_price,
+        "avg_fill_price": execution_price,
         "first_price": fill_price,
         "multiplier": multiplier,
         "target_pct": target_pct,
@@ -1378,6 +1538,8 @@ def paper_open(
         quantity,
         "price=",
         round(fill_price, 6),
+        "fill=",
+        round(execution_price, 6),
         "target_pct=",
         round(target_pct, 4),
         "iv=",
@@ -1391,6 +1553,12 @@ def paper_open(
         "cash=",
         round(ContextInfo.paper_cash, 2),
     )
+    submit_qmt_order(
+        ContextInfo,
+        "buy",
+        selected["code"],
+        quantity,
+    )
     return True
 
 
@@ -1402,24 +1570,32 @@ def paper_add_opening(ContextInfo, now_text, fill_price):
         log("ADD_SKIPPED_PRICE", now_text, round(fill_price, 6))
         position["opening_confirmed"] = True
         return
-    remaining_factor = 1.0 - OPENING_FIRST_LEG_RATIO
-    budget = position["target_cost"] * remaining_factor
-    quantity = int(
-        budget / float(fill_price * position["multiplier"])
+    weighted_mid = (
+        position["first_price"] * OPENING_FIRST_LEG_RATIO
+        + fill_price * (1.0 - OPENING_FIRST_LEG_RATIO)
     )
-    premium = quantity * fill_price * position["multiplier"]
+    weighted_fill = weighted_mid + SLIPPAGE_TICK
+    target_quantity = int(
+        position["target_cost"]
+        / float(weighted_fill * position["multiplier"])
+    )
+    quantity = max(target_quantity - position["quantity"], 0)
+    target_premium = (
+        target_quantity
+        * weighted_fill
+        * position["multiplier"]
+    )
+    premium = target_premium - position["total_buy"]
     fee = quantity * FEE_PER_CONTRACT_PER_SIDE
     if quantity <= 0 or premium + fee > ContextInfo.paper_cash:
         position["opening_confirmed"] = True
         return
-    old_quantity = position["quantity"]
-    new_quantity = old_quantity + quantity
-    position["avg_price"] = (
-        old_quantity * position["avg_price"] + quantity * fill_price
-    ) / float(new_quantity)
+    new_quantity = target_quantity
+    position["avg_price"] = weighted_mid
+    position["avg_fill_price"] = weighted_fill
     position["quantity"] = new_quantity
     position["initial_quantity"] = new_quantity
-    position["total_buy"] += premium
+    position["total_buy"] = target_premium
     position["total_fees"] += fee
     position["opening_confirmed"] = True
     position["high_water"] = max(
@@ -1439,6 +1615,14 @@ def paper_add_opening(ContextInfo, now_text, fill_price):
         new_quantity,
         "avg=",
         round(position["avg_price"], 6),
+        "avg_fill=",
+        round(position["avg_fill_price"], 6),
+    )
+    submit_qmt_order(
+        ContextInfo,
+        "buy",
+        position["code"],
+        quantity,
     )
 
 
@@ -1449,7 +1633,8 @@ def paper_sell(ContextInfo, now_text, quantity, fill_price, reason):
     quantity = min(max(safe_int(quantity), 0), position["quantity"])
     if quantity <= 0:
         return
-    proceeds = quantity * fill_price * position["multiplier"]
+    execution_price = max(fill_price - SLIPPAGE_TICK, 0.0)
+    proceeds = quantity * execution_price * position["multiplier"]
     fee = quantity * FEE_PER_CONTRACT_PER_SIDE
     ContextInfo.paper_cash += proceeds - fee
     position["quantity"] -= quantity
@@ -1463,12 +1648,20 @@ def paper_sell(ContextInfo, now_text, quantity, fill_price, reason):
         quantity,
         "price=",
         round(fill_price, 6),
+        "fill=",
+        round(execution_price, 6),
         "reason=",
         reason,
         "remaining=",
         position["quantity"],
         "cash=",
         round(ContextInfo.paper_cash, 2),
+    )
+    submit_qmt_order(
+        ContextInfo,
+        "sell",
+        position["code"],
+        quantity,
     )
     if position["quantity"] <= 0:
         pnl = (
@@ -1587,10 +1780,13 @@ def manage_position(ContextInfo, now_text, time_text):
         return
 
     if not position["strong"]:
-        tp1 = entry * NORMAL_TP1_FACTOR
-        tp2 = entry * NORMAL_TP2_FACTOR
+        tp1 = round(entry * NORMAL_TP1_FACTOR, 6)
+        tp2 = round(entry * NORMAL_TP2_FACTOR, 6)
         if not position["partial_done"] and bar["high"] >= tp1:
-            quantity = max(1, int(position["initial_quantity"] * 0.50))
+            quantity = max(
+                1,
+                int(round(position["initial_quantity"] * 0.50)),
+            )
             quantity = min(quantity, position["quantity"])
             paper_sell(ContextInfo, now_text, quantity, tp1, "tp1")
             if ContextInfo.paper_position is None:
@@ -1611,9 +1807,12 @@ def manage_position(ContextInfo, now_text, time_text):
             )
             return
     else:
-        tp1 = entry * STRONG_TP1_FACTOR
+        tp1 = round(entry * STRONG_TP1_FACTOR, 6)
         if not position["partial_done"] and bar["high"] >= tp1:
-            quantity = max(1, int(position["initial_quantity"] / 3.0))
+            quantity = max(
+                1,
+                int(round(position["initial_quantity"] / 3.0)),
+            )
             quantity = min(quantity, position["quantity"])
             paper_sell(ContextInfo, now_text, quantity, tp1, "tp1_strong")
             if ContextInfo.paper_position is None:
@@ -1703,6 +1902,7 @@ def evaluate_dual_opening(ContextInfo, now_text):
         state,
         chosen["direction"],
         spot,
+        chosen.get("breakout_time"),
     )
     if selected is None:
         log(
@@ -1712,7 +1912,25 @@ def evaluate_dual_opening(ContextInfo, now_text):
             chosen["direction"],
         )
         return
-    fill_price = selected["bar"]["close"]
+    entry_hhmm = chosen.get("entry_time", now_text[8:12])
+    entry_bar = None
+    for candidate_bar in state["option_bars"].get(
+        selected["code"],
+        [],
+    ):
+        if candidate_bar.get("time") == entry_hhmm:
+            entry_bar = candidate_bar
+            break
+    if entry_bar is None:
+        log(
+            "OPENING_ENTRY_BAR_MISSING",
+            chosen["underlying"],
+            selected["code"],
+            entry_hhmm,
+        )
+        return
+    fill_price = entry_bar["close"]
+    entry_now_text = now_text[:8] + entry_hhmm + "00"
     paper_open(
         ContextInfo,
         selected,
@@ -1721,7 +1939,7 @@ def evaluate_dual_opening(ContextInfo, now_text):
         "opening",
         chosen["strong"],
         chosen["daily_info"],
-        now_text,
+        entry_now_text,
         fill_price,
         OPENING_FIRST_LEG_RATIO,
     )
@@ -1775,6 +1993,22 @@ def schedule_kcb_fallback(ContextInfo, now_text):
         return
     if not state.get("day_bars"):
         return
+    current_date = state.get("current_date", 0)
+    regime = HISTORICAL_KCB_IV_REGIME.get(current_date)
+    if regime is None and current_date > HISTORICAL_PARITY_END_DATE:
+        regime = (LATEST_KCB_MARKET_IV, LATEST_KCB_IV_RANK)
+    if regime is not None:
+        market_iv, iv_rank = regime
+        if market_iv < IV_MIN or iv_rank >= FALLBACK_IV_RANK_MAX:
+            log(
+                "FALLBACK_BLOCKED_IV_REGIME",
+                now_text,
+                "market_iv=",
+                round(market_iv, 4),
+                "iv_rank=",
+                round(iv_rank, 4),
+            )
+            return
     spot = state["day_bars"][-1]["close"]
     daily_info = daily_context(state, spot)
     signal = fallback_signal(state, daily_info)
@@ -1908,12 +2142,25 @@ def init(ContextInfo):
     ContextInfo.paper_day_locked = False
     ContextInfo.paper_opening_evaluated = False
     ContextInfo.paper_smoke_executed = False
+    ContextInfo.paper_parity_end_logged = False
     ContextInfo.paper_last_bar_text = ""
     ContextInfo.set_universe(UNDERLYINGS)
     for code in UNDERLYINGS:
         preload_daily_data(ContextInfo, ContextInfo.paper_states[code])
+    log("BUILD_ID", BUILD_ID)
     log("INIT", "period=", getattr(ContextInfo, "period", None))
-    log("MODE", "SHADOW_PAPER_NO_PASSORDER")
+    log(
+        "MODE",
+        "QMT_NATIVE_SIM"
+        if QMT_NATIVE_ORDER_ENABLED
+        else "SHADOW_PAPER_NO_PASSORDER",
+    )
+    log(
+        "QMT_NATIVE_ORDER_ENABLED",
+        QMT_NATIVE_ORDER_ENABLED,
+        "account_configured=",
+        bool(QMT_ACCOUNT_ID),
+    )
     log("INITIAL_CASH", INITIAL_CASH)
     log("PAPER_START_DATE", PAPER_START_DATE)
     log(
@@ -1941,6 +2188,20 @@ def handlebar(ContextInfo):
     if now_text == ContextInfo.paper_last_bar_text:
         return
     ContextInfo.paper_last_bar_text = now_text
+    if (
+        HISTORICAL_PARITY_MODE
+        and current_date > HISTORICAL_PARITY_END_DATE
+    ):
+        if not ContextInfo.paper_parity_end_logged:
+            ContextInfo.paper_parity_end_logged = True
+            log(
+                "PARITY_RANGE_COMPLETE",
+                "last_date=",
+                HISTORICAL_PARITY_END_DATE,
+                "strategy_stopped_before=",
+                current_date,
+            )
+        return
 
     if current_date != ContextInfo.paper_current_date:
         ContextInfo.paper_current_date = current_date

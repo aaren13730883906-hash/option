@@ -1,0 +1,2 @@
+strategy_version,underlying,start,end,initial_capital,final_capital,net_pnl,total_return,trades,kcb_trades,cyb_trades,resolved_overlap_dates,win_rate_net,total_fees,max_drawdown,overlap_policy
+v1.2_dual_underlying,588000+159915,2024-07-01,2026-06-30,100000.0,558534.09,458534.08999999997,4.585340899999999,27,22,5,2,0.8148148148148148,23040.0,0.13214094597398623,opening priority; otherwise earliest fallback then stronger normalized signal

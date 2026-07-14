@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 RESEARCH_DIR = ROOT / "research"
 INTRADAY_CACHE = DATA_DIR / "intraday_cache"
+ETF_INTRADAY_IFIND = DATA_DIR / "etf_intraday_ifind"
 DAILY_CSV = DATA_DIR / "kcb_option_daily.csv"
 MARKET_IV_CSV = DATA_DIR / "kcb_market_iv_daily.csv"
 ETF_DAILY_CSV = DATA_DIR / "etf_daily_588000_588080.csv"
@@ -71,6 +72,38 @@ def parse_args() -> argparse.Namespace:
         help="Reject non-strong ETF bars before contract selection and trade-state updates.",
     )
     parser.add_argument(
+        "--fallback-progress-min",
+        type=float,
+        default=1.15,
+        help=(
+            "Minimum same-time cumulative-volume ratio for regular 15m strong "
+            "fallback signals. Early 5m signals keep their fixed 1.50 gate."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-trading-days",
+        type=int,
+        default=20,
+        help="ETF trading days loaded before the tradable start date for rolling indicators.",
+    )
+    parser.add_argument(
+        "--late-trend-acceleration",
+        action="store_true",
+        help=(
+            "Experiment: accept regular 15m fallback as strong from 1.8x local "
+            "volume only when cumulative progress, breakout, EMA and close-position gates pass."
+        ),
+    )
+    parser.add_argument("--late-strong-volume-mult", type=float, default=1.8)
+    parser.add_argument(
+        "--high-iv-crash-put",
+        action="store_true",
+        help="Experiment: extend fallback Put contract IV to 90% and cap premium position at 25%.",
+    )
+    parser.add_argument("--high-iv-put-min", type=float, default=0.70)
+    parser.add_argument("--high-iv-put-max", type=float, default=0.90)
+    parser.add_argument("--high-iv-put-position-cap", type=float, default=0.25)
+    parser.add_argument(
         "--position-multiplier",
         type=float,
         default=1.0,
@@ -82,9 +115,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def position_pct_for_signal(iv_rank: float, etf_volume_ratio: float) -> tuple[float, str]:
+def position_pct_for_signal(
+    iv_rank: float,
+    etf_volume_ratio: float,
+    strong_volume_min: float = 2.0,
+) -> tuple[float, str]:
     """Return premium allocation and signal label for v0.9 sizing."""
-    strong = etf_volume_ratio >= 2.0
+    strong = etf_volume_ratio >= strong_volume_min
     if iv_rank >= 0.35:
         return (0.15, "strong_reduced") if strong else (0.10, "reduced")
     return (0.20, "strong") if strong else (0.20, "normal")
@@ -349,10 +386,53 @@ def load_etf_15m(sqlite_path: Path, underlyings: list[str], start: str, end: str
     """
     with sqlite3.connect(sqlite_path) as conn:
         bars = pd.read_sql_query(sql, conn, params=params)
-    if bars.empty:
-        raise RuntimeError(f"No ETF bars found in {sqlite_path}")
-    bars["datetime"] = pd.to_datetime(bars["dt"])
-    bars["underlying_code"] = bars["symbol"].str.slice(0, 6)
+    source_frames: list[pd.DataFrame] = []
+    if not bars.empty:
+        local = bars.copy()
+        local["datetime"] = pd.to_datetime(local["dt"])
+        local["underlying_code"] = local["symbol"].str.slice(0, 6)
+        source_frames.append(
+            local[
+                [
+                    "datetime",
+                    "underlying_code",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                ]
+            ]
+        )
+    start_date = pd.Timestamp(start)
+    end_date = pd.Timestamp(end)
+    for code in underlyings:
+        for path in sorted(ETF_INTRADAY_IFIND.glob(f"*_{code}_1m.csv")):
+            date_text = path.name[:10]
+            trade_date = pd.Timestamp(date_text)
+            if trade_date < start_date or trade_date > end_date:
+                continue
+            extra = pd.read_csv(path, parse_dates=["datetime"])
+            extra["underlying_code"] = code
+            source_frames.append(
+                extra[
+                    [
+                        "datetime",
+                        "underlying_code",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "amount",
+                    ]
+                ]
+            )
+    if not source_frames:
+        raise RuntimeError(f"No ETF bars found in {sqlite_path} or {ETF_INTRADAY_IFIND}")
+    bars = pd.concat(source_frames, ignore_index=True)
+    bars = bars.drop_duplicates(["underlying_code", "datetime"], keep="last")
     frames: list[pd.DataFrame] = []
     for code, group in bars.groupby("underlying_code"):
         g = group.set_index("datetime").sort_index()
@@ -395,11 +475,71 @@ def load_etf_5m(sqlite_path: Path, underlyings: list[str], start: str, end: str)
         order by symbol, dt
     """
     with sqlite3.connect(sqlite_path) as conn:
-        out = pd.read_sql_query(sql, conn, params=params)
-    if out.empty:
-        raise RuntimeError(f"No ETF 5m bars found in {sqlite_path}")
-    out["datetime"] = pd.to_datetime(out["dt"])
-    out["underlying_code"] = out["symbol"].str.slice(0, 6)
+        bars = pd.read_sql_query(sql, conn, params=params)
+
+    source_frames: list[pd.DataFrame] = []
+    if not bars.empty:
+        local = bars.copy()
+        local["datetime"] = pd.to_datetime(local["dt"])
+        local["underlying_code"] = local["symbol"].str.slice(0, 6)
+        source_frames.append(
+            local[
+                [
+                    "datetime",
+                    "underlying_code",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                ]
+            ]
+        )
+
+    start_date = pd.Timestamp(start)
+    end_date = pd.Timestamp(end)
+    for code in underlyings:
+        for path in sorted(ETF_INTRADAY_IFIND.glob(f"*_{code}_1m.csv")):
+            date_text = path.name[:10]
+            trade_date = pd.Timestamp(date_text)
+            if trade_date < start_date or trade_date > end_date:
+                continue
+            extra = pd.read_csv(path, parse_dates=["datetime"])
+            if extra.empty:
+                continue
+            extra["underlying_code"] = code
+            g = extra.set_index("datetime").sort_index()
+            five = g.resample("5min", label="right", closed="right").agg(
+                open=("open", "first"),
+                high=("high", "max"),
+                low=("low", "min"),
+                close=("close", "last"),
+                volume=("volume", "sum"),
+                amount=("amount", "sum"),
+            )
+            five = five.dropna(subset=["close"]).reset_index()
+            five["underlying_code"] = code
+            source_frames.append(
+                five[
+                    [
+                        "datetime",
+                        "underlying_code",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "amount",
+                    ]
+                ]
+            )
+
+    if not source_frames:
+        raise RuntimeError(f"No ETF 5m bars found in {sqlite_path} or {ETF_INTRADAY_IFIND}")
+
+    out = pd.concat(source_frames, ignore_index=True)
+    out = out.drop_duplicates(["underlying_code", "datetime"], keep="last")
     out["trade_date"] = out["datetime"].dt.strftime("%Y-%m-%d")
     out["time"] = out["datetime"].dt.strftime("%H:%M")
     out = out.sort_values(["underlying_code", "datetime"])
@@ -441,6 +581,9 @@ def option_candidates(
     direction: str,
     pool: int,
     allow_edge_dte: bool = False,
+    high_iv_crash_put: bool = False,
+    high_iv_put_min: float = 0.70,
+    high_iv_put_max: float = 0.90,
 ) -> pd.DataFrame:
     td = pd.Timestamp(trade_date)
     cur_ym = td.year * 100 + td.month
@@ -456,14 +599,24 @@ def option_candidates(
     d["expiry_date"] = d["expiry_ym"].map(expiry_date)
     d["dte"] = (d["expiry_date"] - td).dt.days
     d["abs_delta"] = d["delta"].abs()
+    iv_ok = d["implied_volatility"].between(0.20, 0.70)
+    if direction == "put" and high_iv_crash_put:
+        iv_ok = iv_ok | d["implied_volatility"].between(
+            high_iv_put_min,
+            high_iv_put_max,
+        )
     common = (
         d["expiry_ym"].isin([cur_ym, nxt_ym])
         & d["abs_delta"].between(0.35, 0.65)
-        & d["implied_volatility"].between(0.20, 0.70)
+        & iv_ok
         & (d["option_volume"] > 0)
     )
     normal = d[common & d["dte"].between(10, 35)].copy()
     if not normal.empty:
+        normal["high_iv_crash_put_candidate"] = (
+            (direction == "put")
+            & (normal["implied_volatility"] >= high_iv_put_min)
+        )
         normal["edge_dte_candidate"] = False
         normal["dte_position_factor"] = 1.0
         return normal.sort_values("option_volume", ascending=False).head(pool)
@@ -471,6 +624,10 @@ def option_candidates(
         return normal
     edge_band = d["dte"].between(7, 9) | d["dte"].between(36, 40)
     edge = d[common & edge_band].copy()
+    edge["high_iv_crash_put_candidate"] = (
+        (direction == "put")
+        & (edge["implied_volatility"] >= high_iv_put_min)
+    )
     edge["edge_dte_candidate"] = True
     edge["dte_position_factor"] = 0.60
     return edge.sort_values("option_volume", ascending=False).head(pool)
@@ -737,6 +894,12 @@ def simulate_exit(
 
 def main() -> None:
     args = parse_args()
+    if not 0 < args.late_strong_volume_mult <= 2.0:
+        raise ValueError("late-strong-volume-mult must be in (0, 2.0]")
+    if not 0 < args.high_iv_put_min <= args.high_iv_put_max <= 3.0:
+        raise ValueError("high-IV Put range is invalid")
+    if not 0 < args.high_iv_put_position_cap <= 1.0:
+        raise ValueError("high-iv-put-position-cap must be in (0, 1]")
     ensure_dirs()
     daily = pd.read_csv(args.daily_csv, dtype={"option_code": str, "contract_id": str, "underlying_code": str})
     market_iv = pd.read_csv(args.market_iv_csv, dtype={"underlying_code": str})
@@ -747,8 +910,30 @@ def main() -> None:
     daily = daily[daily["underlying_code"].isin(underlyings)].copy()
     market_iv = market_iv[(market_iv["trade_date"] >= start.strftime("%Y-%m-%d")) & (market_iv["trade_date"] <= end.strftime("%Y-%m-%d"))]
     daily_direction = load_daily_direction(args.underlying, args.etf_daily_csv)
-    etf15 = load_etf_15m(args.sqlite, underlyings, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-    etf5 = load_etf_5m(args.sqlite, underlyings, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    direction_dates = pd.to_datetime(daily_direction["trade_date"])
+    prior_dates = direction_dates[direction_dates < start].drop_duplicates().sort_values()
+    if args.warmup_trading_days < 20:
+        raise ValueError("warmup-trading-days must be at least 20")
+    if len(prior_dates) < args.warmup_trading_days:
+        raise RuntimeError(
+            "Insufficient ETF history for {} warmup trading days before {}".format(
+                args.warmup_trading_days,
+                start.strftime("%Y-%m-%d"),
+            )
+        )
+    indicator_start = prior_dates.iloc[-args.warmup_trading_days]
+    etf15 = load_etf_15m(
+        args.sqlite,
+        underlyings,
+        indicator_start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
+    etf5 = load_etf_5m(
+        args.sqlite,
+        underlyings,
+        indicator_start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
     early5 = etf5[etf5["time"].isin(["09:35", "09:40"])].copy()
     early5["bar_interval"] = "5m"
     early5["prev3_high"] = early5["prev_high"]
@@ -759,6 +944,10 @@ def main() -> None:
     signal_bars = pd.concat([early5, etf15], ignore_index=True, sort=False).sort_values(
         ["underlying_code", "datetime"]
     )
+    signal_bars = signal_bars[
+        (pd.to_datetime(signal_bars["trade_date"]) >= start)
+        & (pd.to_datetime(signal_bars["trade_date"]) <= end)
+    ].copy()
     token = None if args.no_fetch else get_access_token()
     headers = {"Content-Type": "application/json", "access_token": token} if token else {}
 
@@ -829,7 +1018,18 @@ def main() -> None:
             direction = "call" if call_signal else "put" if put_signal else None
             if direction is None:
                 continue
-            if args.strong_signals_only and etf_volume_ratio < 2.0:
+            strong_volume_min = (
+                args.late_strong_volume_mult
+                if args.late_trend_acceleration and not is_early
+                else 2.0
+            )
+            if args.strong_signals_only and etf_volume_ratio < strong_volume_min:
+                continue
+            if (
+                args.late_trend_acceleration
+                and not is_early
+                and (pd.isna(progress_ratio) or progress_ratio < args.fallback_progress_min)
+            ):
                 continue
             if direction == "call" and close_pos < (0.80 if is_early else 0.75 if bar.time == "09:45" else 0.65):
                 continue
@@ -861,7 +1061,16 @@ def main() -> None:
                 else signal_time
             )
 
-            candidates = option_candidates(daily, trade_date, underlying, direction, args.candidate_pool)
+            candidates = option_candidates(
+                daily,
+                trade_date,
+                underlying,
+                direction,
+                args.candidate_pool,
+                high_iv_crash_put=args.high_iv_crash_put,
+                high_iv_put_min=args.high_iv_put_min,
+                high_iv_put_max=args.high_iv_put_max,
+            )
             if candidates.empty:
                 continue
 
@@ -932,6 +1141,9 @@ def main() -> None:
                         "dte": int(opt.dte),
                         "delta": float(opt.delta),
                         "implied_volatility": float(opt.implied_volatility),
+                        "high_iv_crash_put_candidate": bool(
+                            getattr(opt, "high_iv_crash_put_candidate", False)
+                        ),
                         "bars_1m": opt1,
                     }
                 )
@@ -944,7 +1156,11 @@ def main() -> None:
             execution_time = pd.Timestamp(chosen.pop("execution_time"))
             if day_selected_option is None:
                 day_selected_option = str(chosen["option_code"]).zfill(8)
-            position_pct, signal_strength = position_pct_for_signal(iv_rank, etf_volume_ratio)
+            position_pct, signal_strength = position_pct_for_signal(
+                iv_rank,
+                etf_volume_ratio,
+                strong_volume_min,
+            )
             risk_flags: list[str] = []
             if ma_cluster < 0.022:
                 position_pct, signal_strength = reduce_position(position_pct, signal_strength, "cluster")
@@ -963,7 +1179,14 @@ def main() -> None:
             if pd.notna(progress_ratio) and progress_ratio < 1.00:
                 position_pct, signal_strength = reduce_position(position_pct, signal_strength, "low_intraday_volume")
                 risk_flags.append("low_intraday_volume")
-            if signal_strength.startswith("strong") and pd.notna(progress_ratio) and progress_ratio < 1.50:
+            if (
+                not is_early
+                and signal_strength.startswith("strong")
+                and (
+                    pd.isna(progress_ratio)
+                    or progress_ratio < args.fallback_progress_min
+                )
+            ):
                 position_pct, signal_strength = 0.10, "normal_intraday_volume"
                 risk_flags.append("strong_blocked_intraday_volume")
             if direction == "call" and pd.notna(daily_row["daily_ref_upper_shadow_ratio"]) and daily_row["daily_ref_upper_shadow_ratio"] > 0.45:
@@ -976,6 +1199,10 @@ def main() -> None:
                 position_pct = min(position_pct * args.position_multiplier, args.position_cap)
                 signal_strength = f"{signal_strength}_position_scaled"
                 risk_flags.append(f"position_{args.position_multiplier:g}x")
+            if bool(chosen.get("high_iv_crash_put_candidate", False)):
+                position_pct = min(position_pct, args.high_iv_put_position_cap)
+                signal_strength = f"{signal_strength}_high_iv_crash_put"
+                risk_flags.append("high_iv_crash_put_cap")
             exit_info = simulate_exit(
                 chosen.pop("bars_1m"),
                 day_all_bars,
@@ -1003,6 +1230,10 @@ def main() -> None:
                     "iv_rank_252": iv_rank,
                     "etf_volume_ratio": etf_volume_ratio,
                     "etf_intraday_volume_progress_ratio": progress_ratio,
+                    "fallback_progress_min": args.fallback_progress_min,
+                    "late_trend_acceleration": args.late_trend_acceleration,
+                    "strong_volume_min": strong_volume_min,
+                    "high_iv_crash_put": bool(chosen.get("high_iv_crash_put_candidate", False)),
                     "etf_vol_threshold": vol_threshold,
                     "etf_close_pos": close_pos,
                     "signal_strength": signal_strength,
@@ -1059,6 +1290,13 @@ def main() -> None:
                     "total_simple_return": trades_df["return"].sum(),
                     "best_trade": trades_df["return"].max(),
                     "worst_trade": trades_df["return"].min(),
+                    "warmup_trading_days": args.warmup_trading_days,
+                    "late_trend_acceleration": args.late_trend_acceleration,
+                    "late_strong_volume_mult": args.late_strong_volume_mult,
+                    "high_iv_crash_put": args.high_iv_crash_put,
+                    "high_iv_put_min": args.high_iv_put_min,
+                    "high_iv_put_max": args.high_iv_put_max,
+                    "high_iv_put_position_cap": args.high_iv_put_position_cap,
                 }
             ]
         )
