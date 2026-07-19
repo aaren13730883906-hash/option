@@ -104,6 +104,65 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-iv-put-max", type=float, default=0.90)
     parser.add_argument("--high-iv-put-position-cap", type=float, default=0.25)
     parser.add_argument(
+        "--cluster-acceleration-exemption",
+        action="store_true",
+        help=(
+            "Experiment: when prior-day MA cluster is below 1.5%, allow one "
+            "regular 15m signal with extreme local volume and full trend gates."
+        ),
+    )
+    parser.add_argument("--cluster-exemption-volume-mult", type=float, default=3.0)
+    parser.add_argument("--cluster-exemption-position-cap", type=float, default=0.25)
+    parser.add_argument(
+        "--cluster-exemption-direction",
+        choices=["both", "call", "put"],
+        default="put",
+    )
+    parser.add_argument(
+        "--fallback-option-momentum-confirm",
+        action="store_true",
+        help=(
+            "Experiment: for regular 15m fallback entries, require recent "
+            "1m option prices to still confirm the signal direction."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-option-momentum-direction",
+        choices=["both", "call", "put"],
+        default="both",
+        help="Direction scope for fallback option momentum confirmation.",
+    )
+    parser.add_argument(
+        "--fallback-option-lookback-minutes",
+        type=int,
+        default=8,
+        help="1m option lookback window for fallback momentum confirmation.",
+    )
+    parser.add_argument(
+        "--fallback-option-recent-minutes",
+        type=int,
+        default=3,
+        help="Recent 1m option window that must not move against the signal.",
+    )
+    parser.add_argument(
+        "--fallback-option-pullback-max",
+        type=float,
+        default=0.08,
+        help=(
+            "Maximum allowed pullback from recent option high for Call, or "
+            "bounce from recent option low for Put, during fallback confirmation."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-option-volume-fade-ratio",
+        type=float,
+        default=0.70,
+        help=(
+            "Reject fallback momentum when recent option volume is below this "
+            "ratio of earlier lookback-window volume."
+        ),
+    )
+    parser.add_argument(
         "--position-multiplier",
         type=float,
         default=1.0,
@@ -133,6 +192,63 @@ def reduce_position(position_pct: float, signal_strength: str, reason: str) -> t
     if position_pct >= 0.10:
         return 0.07, f"{signal_strength}_{reason}"
     return position_pct, signal_strength
+
+
+def fallback_option_momentum_ok(
+    opt1: pd.DataFrame,
+    signal_time: pd.Timestamp,
+    direction: str,
+    lookback_minutes: int,
+    recent_minutes: int,
+    pullback_max: float,
+    volume_fade_ratio: float,
+) -> tuple[bool, str]:
+    """Reject fallback signals when the selected option is already fading."""
+    if lookback_minutes <= 1 or recent_minutes <= 1:
+        return True, ""
+    lookback_start = signal_time - pd.Timedelta(minutes=lookback_minutes - 1)
+    path = opt1[
+        (opt1["datetime"] >= lookback_start)
+        & (opt1["datetime"] <= signal_time)
+    ].copy()
+    if len(path) < max(lookback_minutes // 2, recent_minutes):
+        return False, "insufficient_option_momentum_bars"
+
+    closes = path["close"].astype(float)
+    volumes = path["volume"].astype(float)
+    current_close = float(closes.iloc[-1])
+    recent = closes.tail(recent_minutes)
+    recent_volumes = volumes.tail(recent_minutes)
+
+    if direction == "call":
+        recent_high = float(closes.max())
+        if recent_high <= 0:
+            return False, "bad_option_recent_high"
+        pullback = current_close / recent_high - 1.0
+        if pullback < -abs(pullback_max):
+            return False, "call_option_pullback"
+        if recent.is_monotonic_decreasing and float(recent.iloc[-1]) < float(recent.iloc[0]):
+            return False, "call_option_recent_down"
+        if len(volumes) > recent_minutes:
+            prior_volume = float(volumes.iloc[:-recent_minutes].mean())
+            recent_volume = float(recent_volumes.mean())
+            if prior_volume > 0 and recent_volume < prior_volume * volume_fade_ratio:
+                return False, "call_option_volume_fade"
+    else:
+        recent_low = float(closes.min())
+        if recent_low <= 0:
+            return False, "bad_option_recent_low"
+        bounce = current_close / recent_low - 1.0
+        if bounce > abs(pullback_max):
+            return False, "put_option_bounce"
+        if recent.is_monotonic_increasing and float(recent.iloc[-1]) > float(recent.iloc[0]):
+            return False, "put_option_recent_up"
+        if len(volumes) > recent_minutes:
+            prior_volume = float(volumes.iloc[:-recent_minutes].mean())
+            recent_volume = float(recent_volumes.mean())
+            if prior_volume > 0 and recent_volume < prior_volume * volume_fade_ratio:
+                return False, "put_option_volume_fade"
+    return True, ""
 
 
 def market_symbol(underlying: str) -> str:
@@ -979,7 +1095,12 @@ def main() -> None:
         daily_volume_ratio20 = (
             float(daily_row["daily_ref_volume_ratio20"]) if pd.notna(daily_row["daily_ref_volume_ratio20"]) else math.nan
         )
-        if pd.isna(ma_cluster) or ma_cluster < 0.015:
+        cluster_exemption_day = bool(
+            args.cluster_acceleration_exemption
+            and pd.notna(ma_cluster)
+            and ma_cluster < 0.015
+        )
+        if pd.isna(ma_cluster) or (ma_cluster < 0.015 and not cluster_exemption_day):
             continue
         if args.daily_volume_tiered and (
             pd.isna(daily_volume_ratio20) or daily_volume_ratio20 < 0.65
@@ -989,7 +1110,7 @@ def main() -> None:
             continue
 
         for bar in day_bars.itertuples(index=False):
-            if entries >= 2:
+            if entries >= 2 or (cluster_exemption_day and entries >= 1):
                 break
             bar_range = float(bar.high - bar.low)
             close_pos = float((bar.close - bar.low) / bar_range) if bar_range > 0 else 0.5
@@ -1018,6 +1139,15 @@ def main() -> None:
             direction = "call" if call_signal else "put" if put_signal else None
             if direction is None:
                 continue
+            if cluster_exemption_day:
+                if args.cluster_exemption_direction != "both" and direction != args.cluster_exemption_direction:
+                    continue
+                if is_early or etf_volume_ratio < args.cluster_exemption_volume_mult:
+                    continue
+                if pd.isna(progress_ratio) or progress_ratio < args.fallback_progress_min:
+                    continue
+                if daily_breakout_direction(daily_row, float(bar.close)) != direction:
+                    continue
             strong_volume_min = (
                 args.late_strong_volume_mult
                 if args.late_trend_acceleration and not is_early
@@ -1111,6 +1241,24 @@ def main() -> None:
                     continue
                 if not (r["close"] > r["ema5"] > r["ema20"]):
                     continue
+                if (
+                    args.fallback_option_momentum_confirm
+                    and not is_early
+                    and not args.force_entry_time
+                    and args.fallback_option_momentum_direction
+                    in ["both", direction]
+                ):
+                    momentum_ok, momentum_reason = fallback_option_momentum_ok(
+                        opt1,
+                        signal_time,
+                        direction,
+                        args.fallback_option_lookback_minutes,
+                        args.fallback_option_recent_minutes,
+                        args.fallback_option_pullback_max,
+                        args.fallback_option_volume_fade_ratio,
+                    )
+                    if not momentum_ok:
+                        continue
                 if delayed_0945_fill:
                     fill_rows = opt1[opt1["datetime"] >= execution_time].head(1)
                     if fill_rows.empty:
@@ -1199,6 +1347,10 @@ def main() -> None:
                 position_pct = min(position_pct * args.position_multiplier, args.position_cap)
                 signal_strength = f"{signal_strength}_position_scaled"
                 risk_flags.append(f"position_{args.position_multiplier:g}x")
+            if cluster_exemption_day:
+                position_pct = min(position_pct, args.cluster_exemption_position_cap)
+                signal_strength = f"{signal_strength}_cluster_acceleration_exemption"
+                risk_flags.append("cluster_acceleration_exemption_cap")
             if bool(chosen.get("high_iv_crash_put_candidate", False)):
                 position_pct = min(position_pct, args.high_iv_put_position_cap)
                 signal_strength = f"{signal_strength}_high_iv_crash_put"
@@ -1233,6 +1385,9 @@ def main() -> None:
                     "fallback_progress_min": args.fallback_progress_min,
                     "late_trend_acceleration": args.late_trend_acceleration,
                     "strong_volume_min": strong_volume_min,
+                    "cluster_acceleration_exemption": cluster_exemption_day,
+                    "cluster_exemption_direction": args.cluster_exemption_direction,
+                    "cluster_exemption_volume_mult": args.cluster_exemption_volume_mult,
                     "high_iv_crash_put": bool(chosen.get("high_iv_crash_put_candidate", False)),
                     "etf_vol_threshold": vol_threshold,
                     "etf_close_pos": close_pos,
@@ -1297,6 +1452,10 @@ def main() -> None:
                     "high_iv_put_min": args.high_iv_put_min,
                     "high_iv_put_max": args.high_iv_put_max,
                     "high_iv_put_position_cap": args.high_iv_put_position_cap,
+                    "cluster_acceleration_exemption": args.cluster_acceleration_exemption,
+                    "cluster_exemption_direction": args.cluster_exemption_direction,
+                    "cluster_exemption_volume_mult": args.cluster_exemption_volume_mult,
+                    "cluster_exemption_position_cap": args.cluster_exemption_position_cap,
                 }
             ]
         )

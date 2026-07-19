@@ -54,7 +54,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--high-iv-put-min", type=float, default=0.70)
     parser.add_argument("--high-iv-put-max", type=float, default=0.90)
     parser.add_argument("--high-iv-put-position-cap", type=float, default=0.25)
+    parser.add_argument("--cluster-acceleration-exemption", action="store_true")
+    parser.add_argument("--cluster-exemption-volume-mult", type=float, default=3.0)
+    parser.add_argument("--cluster-exemption-position-cap", type=float, default=0.25)
+    parser.add_argument(
+        "--cluster-exemption-direction",
+        choices=["both", "call", "put"],
+        default="put",
+    )
+    parser.add_argument("--fallback-option-momentum-confirm", action="store_true")
+    parser.add_argument(
+        "--fallback-option-momentum-direction",
+        choices=["both", "call", "put"],
+        default="both",
+    )
+    parser.add_argument("--fallback-option-lookback-minutes", type=int, default=8)
+    parser.add_argument("--fallback-option-recent-minutes", type=int, default=3)
+    parser.add_argument("--fallback-option-pullback-max", type=float, default=0.08)
+    parser.add_argument("--fallback-option-volume-fade-ratio", type=float, default=0.70)
     parser.add_argument("--edge-dte-fallback", action="store_true")
+    parser.add_argument(
+        "--disable-long-exhaustion-filter",
+        action="store_true",
+        help="Disable the default 588000 opening-Call long-exhaustion filter.",
+    )
+    parser.add_argument("--long-exhaustion-price-threshold", type=float, default=0.05)
     parser.add_argument(
         "--output",
         type=Path,
@@ -125,6 +149,15 @@ def main() -> None:
             opening_command.extend(["--put-range-threshold", str(args.put_range_threshold)])
         if args.edge_dte_fallback:
             opening_command.append("--edge-dte-fallback")
+        if args.disable_long_exhaustion_filter:
+            opening_command.append("--disable-long-exhaustion-filter")
+        if args.long_exhaustion_price_threshold != 0.05:
+            opening_command.extend(
+                [
+                    "--long-exhaustion-price-threshold",
+                    str(args.long_exhaustion_price_threshold),
+                ]
+            )
         run(opening_command)
         if not args.disable_fallback:
             fallback_command = [
@@ -175,6 +208,34 @@ def main() -> None:
                         str(args.high_iv_put_max),
                         "--high-iv-put-position-cap",
                         str(args.high_iv_put_position_cap),
+                    ]
+                )
+            if args.cluster_acceleration_exemption:
+                fallback_command.extend(
+                    [
+                        "--cluster-acceleration-exemption",
+                        "--cluster-exemption-volume-mult",
+                        str(args.cluster_exemption_volume_mult),
+                        "--cluster-exemption-position-cap",
+                        str(args.cluster_exemption_position_cap),
+                        "--cluster-exemption-direction",
+                        args.cluster_exemption_direction,
+                    ]
+                )
+            if args.fallback_option_momentum_confirm:
+                fallback_command.extend(
+                    [
+                        "--fallback-option-momentum-confirm",
+                        "--fallback-option-momentum-direction",
+                        args.fallback_option_momentum_direction,
+                        "--fallback-option-lookback-minutes",
+                        str(args.fallback_option_lookback_minutes),
+                        "--fallback-option-recent-minutes",
+                        str(args.fallback_option_recent_minutes),
+                        "--fallback-option-pullback-max",
+                        str(args.fallback_option_pullback_max),
+                        "--fallback-option-volume-fade-ratio",
+                        str(args.fallback_option_volume_fade_ratio),
                     ]
                 )
             run(fallback_command)
@@ -238,6 +299,10 @@ def main() -> None:
         summary["high_iv_crash_put"] = args.high_iv_crash_put
         summary["high_iv_put_range"] = "{}-{}".format(args.high_iv_put_min, args.high_iv_put_max)
         summary["high_iv_put_position_cap"] = args.high_iv_put_position_cap
+        summary["cluster_acceleration_exemption"] = args.cluster_acceleration_exemption
+        summary["cluster_exemption_direction"] = args.cluster_exemption_direction
+        summary["cluster_exemption_volume_mult"] = args.cluster_exemption_volume_mult
+        summary["cluster_exemption_position_cap"] = args.cluster_exemption_position_cap
         summary["data_mode"] = "local_cache_only"
         summary.to_csv(args.summary, index=False)
         print(summary.to_string(index=False))

@@ -70,6 +70,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If DTE 10-35 is empty, allow DTE 7-9 or 36-40 at 60% size.",
     )
+    parser.add_argument(
+        "--long-exhaustion-filter",
+        action="store_true",
+        help="Deprecated compatibility flag; the long-exhaustion filter is enabled by default.",
+    )
+    parser.add_argument(
+        "--disable-long-exhaustion-filter",
+        action="store_true",
+        help="Disable the default 588000 opening-Call long-exhaustion filter.",
+    )
+    parser.add_argument("--long-exhaustion-price-threshold", type=float, default=0.05)
     parser.add_argument("--fetch-missing", action="store_true", help="Fetch only missing option 1m caches via iFinD.")
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--retries", type=int, default=3)
@@ -120,6 +131,40 @@ def load_etf_1m(root: Path, trade_date: str, underlying: str) -> pd.DataFrame:
     out["trade_date"] = out["datetime"].dt.strftime("%Y-%m-%d")
     out["time"] = out["datetime"].dt.strftime("%H:%M")
     return out.sort_values("datetime")
+
+
+def load_etf_daily_history(path: Path, underlying: str) -> pd.DataFrame:
+    raw = pd.read_csv(path, dtype={"underlying_code": str})
+    raw = raw[raw["underlying_code"] == underlying].copy()
+    raw["trade_date"] = pd.to_datetime(raw["trade_date"], errors="coerce")
+    for col in ["etf_open", "etf_high", "etf_low", "etf_close", "etf_volume"]:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    raw = raw.dropna(subset=["trade_date", "etf_close"]).sort_values("trade_date")
+    return raw
+
+
+def long_exhaustion_score(
+    daily_history: pd.DataFrame,
+    trade_date: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    result = {
+        "long_exhaustion_score": 0,
+        "long_exhaustion_price": False,
+        "long_exhaustion_action": "normal",
+        "long_exhaustion_2d_return": math.nan,
+    }
+    current_date = pd.Timestamp(trade_date)
+    prior = daily_history[daily_history["trade_date"] < current_date].tail(21).copy()
+    if len(prior) >= 3:
+        result["long_exhaustion_2d_return"] = float(prior.iloc[-1]["etf_close"] / prior.iloc[-3]["etf_close"] - 1)
+        result["long_exhaustion_price"] = (
+            result["long_exhaustion_2d_return"] >= args.long_exhaustion_price_threshold
+        )
+    result["long_exhaustion_score"] = 3 if result["long_exhaustion_price"] else 0
+    if result["long_exhaustion_price"]:
+        result["long_exhaustion_action"] = "block"
+    return result
 
 
 def find_opening_breakout(etf1: pd.DataFrame, daily_direction: str, args: argparse.Namespace) -> dict[str, Any] | None:
@@ -414,6 +459,10 @@ def build_trade(
         "opening_high": signal["opening_high"],
         "opening_low": signal["opening_low"],
         "opening_amp": signal["opening_amp"],
+        "long_exhaustion_score": signal.get("long_exhaustion_score", 0),
+        "long_exhaustion_action": signal.get("long_exhaustion_action", "normal"),
+        "long_exhaustion_price": signal.get("long_exhaustion_price", False),
+        "long_exhaustion_2d_return": signal.get("long_exhaustion_2d_return", math.nan),
         "breakout_time": signal["breakout_time"],
         "breakout_volume": signal["breakout_volume"],
         "breakout_vol_ratio": signal["breakout_vol_ratio"],
@@ -442,6 +491,7 @@ def main() -> None:
 
     daily = pd.read_csv(args.daily_csv, dtype={"option_code": str, "contract_id": str, "underlying_code": str})
     market_iv = pd.read_csv(args.market_iv_csv, dtype={"underlying_code": str})
+    etf_daily_history = load_etf_daily_history(args.etf_daily_csv, args.underlying)
     end = pd.to_datetime(daily["trade_date"].max())
     start = end - pd.Timedelta(days=args.days)
     daily = daily[(daily["trade_date"] >= start.strftime("%Y-%m-%d")) & (daily["trade_date"] <= end.strftime("%Y-%m-%d"))]
@@ -478,6 +528,7 @@ def main() -> None:
         "no_opening_signal": 0,
         "no_contract": 0,
         "daily_volume_blocked": 0,
+        "long_exhaustion_blocked": 0,
         "missing_option_cache": 0,
         "fetched_option_cache": 0,
     }
@@ -504,6 +555,24 @@ def main() -> None:
         if signal is None:
             stats["no_opening_signal"] += 1
             continue
+        long_exhaustion_enabled = (
+            not args.disable_long_exhaustion_filter
+            or args.long_exhaustion_filter
+        )
+        if (
+            long_exhaustion_enabled
+            and args.underlying == "588000"
+            and signal["direction"] == "call"
+        ):
+            exhaustion = long_exhaustion_score(
+                etf_daily_history,
+                trade_date,
+                args,
+            )
+            signal.update(exhaustion)
+            if exhaustion["long_exhaustion_action"] == "block":
+                stats["long_exhaustion_blocked"] += 1
+                continue
         selected, missing_cache, fetched_cache = select_contract(
             daily=daily,
             trade_date=trade_date,
@@ -544,6 +613,8 @@ def main() -> None:
             else args.range_threshold
         ),
         "warmup_trading_days": args.warmup_trading_days,
+        "long_exhaustion_filter": not args.disable_long_exhaustion_filter,
+        "long_exhaustion_price_threshold": args.long_exhaustion_price_threshold,
         **stats,
     }
     pd.DataFrame([summary]).to_csv(args.summary, index=False)
