@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--range-threshold", type=float, default=0.0030)
     parser.add_argument("--put-range-threshold", type=float, default=None)
     parser.add_argument("--breakout-vol-mult", type=float, default=1.30)
+    parser.add_argument("--normal-tp2-factor", type=float, default=1.80)
     parser.add_argument("--disable-fallback", action="store_true")
     parser.add_argument("--fallback-position-multiplier", type=float, default=2.5)
     parser.add_argument("--fallback-position-cap", type=float, default=0.50)
@@ -139,6 +140,8 @@ def main() -> None:
                 str(args.warmup_trading_days),
                 "--breakout-vol-mult",
                 str(args.breakout_vol_mult),
+                "--normal-tp2-factor",
+                str(args.normal_tp2_factor),
                 "--daily-volume-tiered",
                 "--output",
                 str(opening_path),
@@ -186,6 +189,8 @@ def main() -> None:
                 str(args.fallback_position_cap),
                 "--fallback-progress-min",
                 str(args.fallback_progress_min),
+                "--normal-tp2-factor",
+                str(args.normal_tp2_factor),
                 "--warmup-trading-days",
                 str(args.warmup_trading_days),
                 "--no-fetch",
@@ -290,6 +295,7 @@ def main() -> None:
         )
         summary["fallback_trades"] = len(fallback)
         summary["fallback_progress_min"] = args.fallback_progress_min
+        summary["normal_tp2_factor"] = args.normal_tp2_factor
         summary["warmup_trading_days"] = args.warmup_trading_days
         summary["put_range_threshold"] = (
             args.put_range_threshold if args.put_range_threshold is not None else args.range_threshold

@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--candidate-pool", type=int, default=8, help="Daily-volume shortlist before iFinD fetch.")
     parser.add_argument("--strong-trailing-pct", type=float, default=0.20)
+    parser.add_argument("--normal-tp2-factor", type=float, default=1.80)
     parser.add_argument("--entry-start-time", default="09:35")
     parser.add_argument("--force-entry-time", default=None)
     parser.add_argument(
@@ -787,6 +788,7 @@ def simulate_exit(
     direction: str,
     signal_strength: str,
     strong_trailing_pct: float,
+    normal_tp2_factor: float = 1.80,
     soft_stop_pct: float = 0.82,
     soft_stop_delay_minutes: int = 0,
 ) -> dict[str, Any]:
@@ -811,7 +813,7 @@ def simulate_exit(
     is_strong = str(signal_strength).startswith("strong")
     if not is_strong:
         tp1 = entry_price * 1.35
-        tp2 = entry_price * 1.80
+        tp2 = entry_price * normal_tp2_factor
         half1_done = False
         exit1_price = math.nan
         exit1_time = pd.NaT
@@ -1363,6 +1365,7 @@ def main() -> None:
                 direction,
                 signal_strength,
                 args.strong_trailing_pct,
+                args.normal_tp2_factor,
             )
             if str(exit_info.get("exit_reason", "")).startswith("tp"):
                 cooldown_until[direction] = pd.Timestamp(exit_info["exit_time"]) + pd.Timedelta(minutes=30)

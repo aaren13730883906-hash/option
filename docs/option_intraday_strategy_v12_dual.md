@@ -404,6 +404,49 @@ PYTHONPATH=.deps python3 scripts/backtest_v11_opening_plus_strong15m.py \
 
 结论：该规则比午后 Put 反抽保护更有价值，且过滤结果干净；目前作为候选正式规则保留。推荐参数为 `8%` 回撤阈值、`3` 分钟连续走弱、`70%` 量能衰减。
 
+### 固定入场后的止盈敏感性记录
+
+在“长窗口鲁棒基准 + 备用 Call 期权动量确认”的 `621.81%` 版本上，固定全部入场交易不变，只重算退出规则，测试 normal 早盘大趋势是否应该比原规则多拿一段。
+
+基准退出：
+
+- normal 信号：`TP1 = 1.35` 卖 `50%`，`TP2 = 1.80` 卖剩余 `50%`。
+- strong 信号：`TP1 = 1.50` 卖 `1/3`，剩余 `2/3` 移动止盈；`10:30` 前回撤 `35%`，`10:30` 后回撤 `20%`。
+
+当前最优退出实验：
+
+- normal 信号：`TP1 = 1.35` 卖 `50%`，`TP2 = 3.00` 卖剩余 `50%`；若未触发 TP2，`14:55` 平仓。
+- strong 信号：维持原移动止盈规则不变。
+
+验证结果：
+
+| 口径 | 退出规则 | 期末资金 | 总收益率 | 交易数 | 净胜率 | 最大回撤 |
+|---|---|---:|---:|---:|---:|---:|
+| 固定入场基准 | normal TP2 = `1.80` | 721,809.93 元 | 621.81% | 22 | 86.36% | 8.06% |
+| 固定入场止盈优化 | normal TP2 = `3.00` | 853,372.52 元 | 753.37% | 22 | 86.36% | 8.06% |
+| 固定入场止盈优化 | opening normal TP1 后 runner，`35%` 移动止盈 | 845,822.63 元 | 745.82% | 22 | 86.36% | 8.06% |
+
+核心改善来自 `2025-08-22` 早盘 Call：原规则在 `13:15` 固定 TP2 出场，收益 `57.50%`；TP2 提高到 `3.00` 后未触发固定止盈，持有到 `14:55`，该笔收益提升到 `112.19%`。
+
+完整流程复核：
+
+- 已将 `normal TP2 = 3.00` 写入完整回测代码参数 `--normal-tp2-factor`。
+- 默认旧口径 `normal TP2 = 1.80` 可完整复现 `621.81%`，说明参数化没有破坏原策略。
+- 使用 `normal TP2 = 3.00` 重新跑完整流程后，结果与固定入场止盈实验一致：期末资金 `853,372.52` 元，总收益率 `753.37%`，交易数 `22`，净胜率 `86.36%`，最大回撤 `8.06%`。
+
+因此，`normal TP2 = 3.00` 是当前科创-only 长窗口完整回测下的最佳确认版本。
+
+对应实验文件：
+
+- `research/exit_variant_kcb_base621_summary.csv`
+- `research/exit_variant_kcb_base621_normal_fixed_tp2_3.0_trades.csv`
+- `research/full_confirm_tp2_1p8_summary.csv`
+- `research/full_confirm_tp2_1p8_trades.csv`
+- `research/full_confirm_tp2_1p8_capital.csv`
+- `research/full_confirm_tp2_3p0_summary.csv`
+- `research/full_confirm_tp2_3p0_trades.csv`
+- `research/full_confirm_tp2_3p0_capital.csv`
+
 ## 科创早盘 Call 多头透支过滤
 
 该规则已写入科创板主策略。它只作用于科创早盘 Call，不影响 Put，也不影响 15 分钟备用策略。

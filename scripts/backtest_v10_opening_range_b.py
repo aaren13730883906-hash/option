@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--etf-daily-csv", type=Path, default=bt.ETF_DAILY_CSV)
     parser.add_argument("--candidate-pool", type=int, default=8)
     parser.add_argument("--strong-trailing-pct", type=float, default=0.25)
+    parser.add_argument("--normal-tp2-factor", type=float, default=1.80)
     parser.add_argument("--range-threshold", type=float, default=0.003)
     parser.add_argument(
         "--put-range-threshold",
@@ -418,6 +419,7 @@ def build_trade(
             direction=signal["direction"],
             signal_strength=signal_strength,
             strong_trailing_pct=args.strong_trailing_pct,
+            normal_tp2_factor=args.normal_tp2_factor,
             soft_stop_pct=args.soft_stop_pct,
             soft_stop_delay_minutes=args.soft_stop_delay_minutes,
         )
