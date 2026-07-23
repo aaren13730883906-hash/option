@@ -1,0 +1,2 @@
+initial_capital,final_capital,net_pnl,total_return,trades,skipped_trades,win_rate,max_drawdown,max_volume_share,p90_volume_share,p95_volume_share,addon_selected,addon_after_same_day_skip,addon_same_day_skipped
+100000.0,1301625.3599999996,1201625.3599999996,12.016253599999997,76,6,0.6973684210526315,0.09853686506260234,0.04937361827560796,0.03116246202875539,0.041477064551864506,61,60,1

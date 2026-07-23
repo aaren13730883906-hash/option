@@ -1,0 +1,2 @@
+scenario,initial_capital,final_capital,net_pnl,total_return_pct,trades,skipped_trades,win_rate_pct,max_drawdown_pct,max_volume_share_pct,exit_optimization_1,exit_optimization_2
+trend_ma20dev3_tp10_plus_nofollow1030,100000.0,1485100.36,1385100.36,1385.10036,75,7,77.33333333333333,8.680923977707018,4.88,put_reversal_only_ma20dev_ge_3pct_quick_tp_10pct,all_put_no_follow_1030_high_lt_5pct_close_lte_neg_3pct
