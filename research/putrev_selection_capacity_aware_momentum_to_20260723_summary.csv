@@ -1,0 +1,2 @@
+scenario,final_capital,total_return_pct,trades,skipped,win_rate_pct,max_dd_pct,addon_trades,addon_pnl,max_vol_share_pct,new_selected_after_base_end,new_unselected_after_base_end,base_end_date,extended_end_date
+capacity_aware_momentum_to_20260723,1859553.3999999994,1759.5533999999993,73,13,80.82191780821918,8.685066557679427,51,484097.9400000001,4.88,4,1,2026-06-29,2026-07-22
