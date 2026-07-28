@@ -25,7 +25,7 @@ import math
 # User configuration
 # ---------------------------------------------------------------------------
 
-BUILD_ID = "KCB_1032_LIVE_SIM_20260726_R2_BBO"
+BUILD_ID = "KCB_1032_LIVE_SIM_20260728_R5_LIQUIDITY_EXEC_AUDIT"
 KCB_CODE = "588000.SH"
 UNDERLYINGS = [KCB_CODE]
 
@@ -51,11 +51,20 @@ QMT_USE_FULL_TICK_BBO = True
 QMT_BBO_REQUIRE_LAST_BAR = True
 QMT_BBO_MIN_ASK_VOL = 1.0
 QMT_BBO_MIN_BID_VOL = 1.0
+QMT_LIQUIDITY_AWARE_ORDER = True
+QMT_LIQUIDITY_REQUIRE_FULL_TICK = True
+QMT_LIQUIDITY_LEVELS = 5
+QMT_LIQUIDITY_CONTINUE_ADD = True
+QMT_LIQUIDITY_ADD_MAX_PRICE_FACTOR = 1.03
+QMT_LIQUIDITY_ADD_MIN_PRICE_FACTOR = 0.98
+QMT_LIQUIDITY_ADD_REQUIRE_SIGNAL_ALIVE = True
+QMT_LOG_TRADE_DETAIL_AFTER_ORDER = True
 
 LIVE_MAX_TRADES_PER_DAY = 1
 LIVE_MAX_CONTRACTS = 0
 LIVE_REQUIRE_LAST_BAR_FOR_ORDER = False
-LIVE_WALL_CLOCK_GATE = False
+LIVE_WALL_CLOCK_GATE = True
+LIVE_TRADE_DATE_OVERRIDE = 0
 
 DTE_MIN = 10
 DTE_MAX = 35
@@ -197,6 +206,13 @@ def masked_account(account_id):
     return text[:3] + "****" + text[-3:]
 
 
+def short_repr(value, max_len=800):
+    text = repr(value)
+    if len(text) > max_len:
+        return text[:max_len] + "...TRUNCATED"
+    return text
+
+
 def safe_float(value, default=None):
     try:
         number = float(value)
@@ -336,6 +352,95 @@ def current_datetime(ContextInfo):
         return "ERROR:%s" % repr(exc), 0, ""
 
 
+def wall_clock_date():
+    try:
+        return safe_int(datetime.datetime.now().strftime("%Y%m%d"))
+    except Exception:
+        return 0
+
+
+def live_trade_date():
+    override = safe_int(LIVE_TRADE_DATE_OVERRIDE)
+    if override > 0:
+        return override
+    return wall_clock_date()
+
+
+def live_date_gate_allows(ContextInfo, now_text, current_date):
+    if not LIVE_WALL_CLOCK_GATE:
+        return True
+    target_date = live_trade_date()
+    if target_date <= 0:
+        return True
+    if current_date == target_date:
+        return True
+    if not getattr(ContextInfo, "live_date_gate_skip_logged", False):
+        ContextInfo.live_date_gate_skip_logged = True
+        log(
+            "LIVE_DATE_GATE_SKIP",
+            "target_date=", target_date,
+            "first_skipped_bar=", now_text,
+            "bar_date=", current_date,
+            "note=", "historical_bar_ignored",
+        )
+    return False
+
+
+def read_native_account_snapshot():
+    attempts = [
+        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, "account"),
+        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, "account", QMT_STRATEGY_NAME),
+    ]
+    for args in attempts:
+        try:
+            return True, get_trade_detail_data(*args)
+        except Exception:
+            pass
+    return False, None
+
+
+def read_native_trade_detail(kind):
+    attempts = [
+        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, kind),
+        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, kind, QMT_STRATEGY_NAME),
+    ]
+    last_error = None
+    for args in attempts:
+        try:
+            return True, get_trade_detail_data(*args)
+        except Exception as exc:
+            last_error = repr(exc)
+    return False, last_error
+
+
+def log_trade_detail_snapshots(ContextInfo, label):
+    if not QMT_LOG_TRADE_DETAIL_AFTER_ORDER:
+        return
+    for kind in ["order", "deal", "position", "account"]:
+        ok, data = read_native_trade_detail(kind)
+        log("TRADE_DETAIL", label, "kind=", kind, "ok=", ok, "data=", short_repr(data))
+
+
+def log_live_account_status(ContextInfo, label):
+    native_ok, native_snapshot = read_native_account_snapshot()
+    position_code = ContextInfo.position["code"] if ContextInfo.position else "NONE"
+    snapshot_text = repr(native_snapshot)
+    if len(snapshot_text) > 500:
+        snapshot_text = snapshot_text[:500] + "...TRUNCATED"
+    log(
+        "LIVE_ACCOUNT_STATUS",
+        label,
+        "account=", masked_account(QMT_ACCOUNT_ID),
+        "native_ok=", native_ok,
+        "native=", snapshot_text,
+        "shadow_cash=", round(ContextInfo.cash, 2),
+        "shadow_equity=", round(paper_equity(ContextInfo), 2),
+        "shadow_position=", position_code,
+        "day_entries=", ContextInfo.day_entries,
+        "trade_count=", ContextInfo.trade_count,
+    )
+
+
 def recursive_number(value, code, field_name):
     if isinstance(value, (int, float)):
         return safe_float(value)
@@ -440,6 +545,18 @@ def first_positive_number(value):
     return None
 
 
+def positive_number_at(value, index):
+    if isinstance(value, (list, tuple)):
+        if index < len(value):
+            number = safe_float(value[index])
+            if number is not None and number > 0:
+                return number
+        return None
+    if index == 0:
+        return first_positive_number(value)
+    return None
+
+
 def read_tick_key(row, keys):
     if not isinstance(row, dict):
         return None
@@ -468,6 +585,81 @@ def nested_tick_row(raw, code):
             if alt in raw:
                 return raw.get(alt)
     return raw
+
+
+def tick_level_value(row, side, field_name, level_index):
+    if side == "ask" and field_name == "price":
+        base = read_tick_key(row, ["askPrice", "ask_price", "ask", "sellPrice"])
+        numbered = [
+            "askPrice%d" % (level_index + 1),
+            "ask%d" % (level_index + 1),
+            "sellPrice%d" % (level_index + 1),
+            "sell%dPrice" % (level_index + 1),
+        ]
+    elif side == "ask" and field_name == "volume":
+        base = read_tick_key(row, ["askVol", "ask_vol", "askVolume", "sellVol"])
+        numbered = [
+            "askVol%d" % (level_index + 1),
+            "askVolume%d" % (level_index + 1),
+            "sellVol%d" % (level_index + 1),
+            "sell%dVol" % (level_index + 1),
+        ]
+    elif side == "bid" and field_name == "price":
+        base = read_tick_key(row, ["bidPrice", "bid_price", "bid", "buyPrice"])
+        numbered = [
+            "bidPrice%d" % (level_index + 1),
+            "bid%d" % (level_index + 1),
+            "buyPrice%d" % (level_index + 1),
+            "buy%dPrice" % (level_index + 1),
+        ]
+    else:
+        base = read_tick_key(row, ["bidVol", "bid_vol", "bidVolume", "buyVol"])
+        numbered = [
+            "bidVol%d" % (level_index + 1),
+            "bidVolume%d" % (level_index + 1),
+            "buyVol%d" % (level_index + 1),
+            "buy%dVol" % (level_index + 1),
+        ]
+    found = positive_number_at(base, level_index)
+    if found is not None:
+        return found
+    return first_positive_number(read_tick_key(row, numbered))
+
+
+def tick_side_levels(row, side):
+    levels = []
+    for idx in range(max(1, safe_int(QMT_LIQUIDITY_LEVELS, 5))):
+        price = tick_level_value(row, side, "price", idx)
+        volume = tick_level_value(row, side, "volume", idx)
+        if price is not None and price > 0 and volume is not None and volume > 0:
+            levels.append((price, volume))
+    return levels
+
+
+def format_levels(levels):
+    text = []
+    for idx, item in enumerate(levels or []):
+        text.append("%d:%.4f/%d" % (idx + 1, item[0], int(item[1])))
+    return ",".join(text)
+
+
+def executable_qty_from_levels(side, levels, limit_price):
+    quantity = 0
+    notional = 0.0
+    worst_price = None
+    for price, volume in levels or []:
+        if side == "buy" and price > limit_price:
+            continue
+        if side == "sell" and price < limit_price:
+            continue
+        take = int(volume)
+        if take <= 0:
+            continue
+        quantity += take
+        notional += take * price
+        worst_price = price
+    avg_price = notional / float(quantity) if quantity > 0 else None
+    return quantity, avg_price, worst_price
 
 
 def can_use_bbo_now(ContextInfo):
@@ -499,6 +691,16 @@ def read_full_tick_bbo(ContextInfo, code):
     bidv1 = first_positive_number(read_tick_key(row, ["bidVol", "bid_vol", "bidVol1", "bidVolume", "buyVol", "buy1Vol"]))
     askv1 = first_positive_number(read_tick_key(row, ["askVol", "ask_vol", "askVol1", "askVolume", "sellVol", "sell1Vol"]))
     last_price = first_positive_number(read_tick_key(row, ["lastPrice", "last_price", "price", "close"]))
+    bid_levels = tick_side_levels(row, "bid")
+    ask_levels = tick_side_levels(row, "ask")
+    if bid1 is None and bid_levels:
+        bid1 = bid_levels[0][0]
+    if bidv1 is None and bid_levels:
+        bidv1 = bid_levels[0][1]
+    if ask1 is None and ask_levels:
+        ask1 = ask_levels[0][0]
+    if askv1 is None and ask_levels:
+        askv1 = ask_levels[0][1]
     return {
         "ok": bid1 is not None or ask1 is not None,
         "source": "full_tick",
@@ -506,6 +708,8 @@ def read_full_tick_bbo(ContextInfo, code):
         "ask1": ask1,
         "bidv1": bidv1,
         "askv1": askv1,
+        "bid_levels": bid_levels,
+        "ask_levels": ask_levels,
         "last": last_price,
         "time": read_tick_key(row, ["time", "timetag"]),
     }
@@ -537,10 +741,22 @@ def build_order_quote(ContextInfo, side, code, reference_price):
         "ask1": bbo.get("ask1"),
         "bidv1": bbo.get("bidv1"),
         "askv1": bbo.get("askv1"),
+        "bid_levels": bbo.get("bid_levels", []),
+        "ask_levels": bbo.get("ask_levels", []),
         "last": bbo.get("last"),
         "tick_time": bbo.get("time"),
         "bbo_source": bbo.get("source"),
     }
+    if order_price > 0:
+        levels = output.get("ask_levels") if side == "buy" else output.get("bid_levels")
+        liq_qty, liq_avg, liq_worst = executable_qty_from_levels(side, levels, order_price)
+        output["liquidity_qty"] = liq_qty
+        output["liquidity_avg"] = liq_avg
+        output["liquidity_worst"] = liq_worst
+    else:
+        output["liquidity_qty"] = None
+        output["liquidity_avg"] = None
+        output["liquidity_worst"] = None
     return output
 
 
@@ -563,8 +779,43 @@ def log_order_quote(side, code, quantity, quote):
         "ask1=", quote.get("ask1"),
         "askv1=", quote.get("askv1"),
         "bbo_enough=", enough,
+        "liq_qty=", quote.get("liquidity_qty"),
+        "liq_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None,
+        "liq_worst=", quote.get("liquidity_worst"),
+        "bid_levels=", format_levels(quote.get("bid_levels")),
+        "ask_levels=", format_levels(quote.get("ask_levels")),
         "tick_time=", quote.get("tick_time"),
         "bbo_source=", quote.get("bbo_source"),
+    )
+
+
+def log_order_expected_fill(side, code, quantity, quote, label):
+    reference_price = quote.get("liquidity_avg")
+    if reference_price is None:
+        reference_price = quote.get("quote_ref")
+    if reference_price is None:
+        reference_price = quote.get("order_price")
+    multiplier = safe_int(quote.get("multiplier"), CONTRACT_MULTIPLIER_DEFAULT)
+    expected_amount = None
+    if reference_price is not None:
+        expected_amount = reference_price * quantity * multiplier
+    log(
+        "ORDER_EXPECTED_FILL",
+        label,
+        side,
+        code,
+        "qty=", int(quantity),
+        "order_price=", quote.get("order_price"),
+        "quote_source=", quote.get("quote_source"),
+        "bid1=", quote.get("bid1"),
+        "ask1=", quote.get("ask1"),
+        "liq_qty=", quote.get("liquidity_qty"),
+        "liq_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None,
+        "liq_worst=", quote.get("liquidity_worst"),
+        "expected_amount=", round(expected_amount, 2) if expected_amount is not None else None,
+        "expected_fee=", round(quantity * FEE_PER_CONTRACT_PER_SIDE, 2),
+        "bid_levels=", format_levels(quote.get("bid_levels")),
+        "ask_levels=", format_levels(quote.get("ask_levels")),
     )
 
 
@@ -573,6 +824,7 @@ def submit_qmt_order(ContextInfo, side, code, quantity, reference_price, quote=N
     if quote is None:
         quote = build_order_quote(ContextInfo, side, code, reference_price)
     log_order_quote(side, code, quantity, quote)
+    log_order_expected_fill(side, code, quantity, quote, "before_submit")
     if not QMT_NATIVE_ORDER_ENABLED:
         log("ORDER_DRY_RUN", side, code, "qty=", int(quantity))
         return True
@@ -633,9 +885,11 @@ def submit_qmt_order(ContextInfo, side, code, quantity, reference_price, quote=N
                 ContextInfo,
             )
         log("PASSORDER_RETURN", repr(result))
+        log_trade_detail_snapshots(ContextInfo, "after_passorder_%s_%s" % (side, str(code)))
         return True
     except Exception as exc:
         log("PASSORDER_ERROR", repr(exc))
+        log_trade_detail_snapshots(ContextInfo, "after_passorder_error_%s_%s" % (side, str(code)))
         return False
 
 
@@ -911,6 +1165,62 @@ def position_pct(path, strong, iv):
     return FALLBACK_BASE_POSITION
 
 
+def cap_quantity_by_liquidity(side, desired_quantity, quote, label):
+    desired = safe_int(desired_quantity)
+    if desired <= 0:
+        return 0, 0
+    if not QMT_LIQUIDITY_AWARE_ORDER:
+        return desired, desired
+    if quote.get("bbo_source") != "full_tick":
+        log("LIQUIDITY_CAP_SKIPPED", label, "source=", quote.get("bbo_source"), "desired=", desired)
+        if QMT_LIQUIDITY_REQUIRE_FULL_TICK:
+            return 0, desired
+        return desired, desired
+    liquidity_qty = quote.get("liquidity_qty")
+    if liquidity_qty is None:
+        log("LIQUIDITY_CAP_SKIPPED", label, "no_liquidity_qty", "desired=", desired)
+        return desired, desired
+    capped = min(desired, max(0, safe_int(liquidity_qty)))
+    log(
+        "LIQUIDITY_CAP",
+        label,
+        "side=", side,
+        "desired=", desired,
+        "capped=", capped,
+        "liq_qty=", liquidity_qty,
+        "order_price=", quote.get("order_price"),
+        "liq_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None,
+        "liq_worst=", quote.get("liquidity_worst"),
+    )
+    return capped, desired
+
+
+def affordable_quantity(ContextInfo, execution_price, multiplier, desired_quantity):
+    quantity = safe_int(desired_quantity)
+    if quantity <= 0 or execution_price is None or execution_price <= 0:
+        return 0
+    cost_per_contract = execution_price * multiplier + FEE_PER_CONTRACT_PER_SIDE
+    if cost_per_contract <= 0:
+        return 0
+    return min(quantity, int(max(0.0, ContextInfo.cash) / float(cost_per_contract)))
+
+
+def apply_buy_fill_to_position(ContextInfo, pos, quantity, fill_price, execution_price):
+    premium = quantity * execution_price * pos["multiplier"]
+    fee = quantity * FEE_PER_CONTRACT_PER_SIDE
+    old_quantity = pos["quantity"]
+    old_cost = pos.get("avg_fill_price", pos["avg_price"]) * old_quantity * pos["multiplier"]
+    old_signal_cost = pos["avg_price"] * old_quantity * pos["multiplier"]
+    ContextInfo.cash -= premium + fee
+    pos["quantity"] += quantity
+    pos["initial_quantity"] += quantity
+    pos["avg_fill_price"] = (old_cost + premium) / float(pos["quantity"] * pos["multiplier"])
+    pos["avg_price"] = (old_signal_cost + fill_price * quantity * pos["multiplier"]) / float(pos["quantity"] * pos["multiplier"])
+    pos["total_buy"] += premium
+    pos["total_fees"] += fee
+    pos["high_water"] = max(pos["high_water"], fill_price)
+
+
 def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_price, allocation_factor):
     if ContextInfo.position is not None or ContextInfo.day_locked:
         log("BUY_BLOCKED", "position_or_day_locked", now_text, path)
@@ -923,22 +1233,21 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
     target_cost = min(equity * pct, ABS_PREMIUM_CAP)
     buy_budget = target_cost * allocation_factor
     quote = build_order_quote(ContextInfo, "buy", selected["code"], fill_price)
+    quote["multiplier"] = selected["multiplier"]
     execution_price = quote.get("order_price")
     if execution_price is None or execution_price <= 0:
         log("BUY_BLOCKED", "bad_order_price", path, selected["code"], "price=", fill_price)
         return False
-    quantity = int(buy_budget / float(execution_price * selected["multiplier"]))
+    planned_quantity = int(buy_budget / float(execution_price * selected["multiplier"]))
     if LIVE_MAX_CONTRACTS > 0:
-        quantity = min(quantity, LIVE_MAX_CONTRACTS)
+        planned_quantity = min(planned_quantity, LIVE_MAX_CONTRACTS)
+    planned_quantity = affordable_quantity(ContextInfo, execution_price, selected["multiplier"], planned_quantity)
+    quantity, target_quantity = cap_quantity_by_liquidity("buy", planned_quantity, quote, path)
     if quantity <= 0:
-        log("BUY_BLOCKED", "small_budget", path, selected["code"], "budget=", round(buy_budget, 2))
+        log("BUY_BLOCKED", "small_or_no_liquidity", path, selected["code"], "budget=", round(buy_budget, 2), "planned=", planned_quantity, "liq_qty=", quote.get("liquidity_qty"))
         return False
     premium = quantity * execution_price * selected["multiplier"]
     fee = quantity * FEE_PER_CONTRACT_PER_SIDE
-    if premium + fee > ContextInfo.cash:
-        quantity = int(max(0.0, ContextInfo.cash - FEE_PER_CONTRACT_PER_SIDE) / float(execution_price * selected["multiplier"] + FEE_PER_CONTRACT_PER_SIDE))
-        premium = quantity * execution_price * selected["multiplier"]
-        fee = quantity * FEE_PER_CONTRACT_PER_SIDE
     if quantity <= 0:
         return False
     if not submit_qmt_order(ContextInfo, "buy", selected["code"], quantity, fill_price, quote):
@@ -972,10 +1281,15 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
         "entry_ask1": quote.get("ask1"),
         "entry_bidv1": quote.get("bidv1"),
         "entry_askv1": quote.get("askv1"),
+        "liquidity_target_quantity": target_quantity,
+        "liquidity_pending_quantity": max(0, target_quantity - quantity),
+        "liquidity_add_enabled": QMT_LIQUIDITY_CONTINUE_ADD,
+        "last_liquidity_add_bar": "",
     }
     ContextInfo.day_locked = True
     ContextInfo.day_entries += 1
-    log("BUY", now_text, path, direction, selected["code"], "qty=", quantity, "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "pct=", pct, "target_cost=", round(target_cost, 2), "iv=", round(selected.get("iv", 0), 4), "delta=", round(selected.get("delta", 0), 4), "dte=", selected.get("dte"))
+    log("BUY", now_text, path, direction, selected["code"], "qty=", quantity, "planned=", planned_quantity, "pending=", max(0, target_quantity - quantity), "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "pct=", pct, "target_cost=", round(target_cost, 2), "iv=", round(selected.get("iv", 0), 4), "delta=", round(selected.get("delta", 0), 4), "dte=", selected.get("dte"))
+    log("ORDER_EXECUTION_SUMMARY", "buy_open", "time=", now_text, "path=", path, "code=", selected["code"], "planned=", planned_quantity, "submitted=", quantity, "pending=", max(0, target_quantity - quantity), "limit=", execution_price, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "expected_amount=", round(premium, 2), "expected_fee=", round(fee, 2), "note=", "compare_with_QMT_deal_panel")
     log("SHADOW_FILL_ASSUMED", "buy", selected["code"], "qty=", quantity)
     return True
 
@@ -990,35 +1304,81 @@ def paper_add_opening(ContextInfo, now_text, fill_price):
         return
     weighted_mid = pos["first_price"] * OPENING_FIRST_LEG_RATIO + fill_price * (1.0 - OPENING_FIRST_LEG_RATIO)
     quote = build_order_quote(ContextInfo, "buy", pos["code"], fill_price)
+    quote["multiplier"] = pos["multiplier"]
     execution_price = quote.get("order_price")
     if execution_price is None or execution_price <= 0:
         pos["opening_confirmed"] = True
         return
     target_qty = int(pos["target_cost"] / float(execution_price * pos["multiplier"]))
+    if LIVE_MAX_CONTRACTS > 0:
+        target_qty = min(target_qty, LIVE_MAX_CONTRACTS)
     quantity = max(target_qty - pos["quantity"], 0)
+    pos["liquidity_target_quantity"] = max(pos.get("liquidity_target_quantity", 0), target_qty)
     if quantity <= 0:
         pos["opening_confirmed"] = True
         return
-    premium = quantity * execution_price * pos["multiplier"]
-    fee = quantity * FEE_PER_CONTRACT_PER_SIDE
-    if premium + fee > ContextInfo.cash:
+    quantity = affordable_quantity(ContextInfo, execution_price, pos["multiplier"], quantity)
+    quantity, desired_quantity = cap_quantity_by_liquidity("buy", quantity, quote, "opening_confirm_add")
+    if quantity <= 0:
+        pos["liquidity_pending_quantity"] = max(0, pos.get("liquidity_target_quantity", target_qty) - pos["quantity"])
+        log("ADD_SKIPPED_LIQUIDITY", now_text, pos["code"], "desired=", desired_quantity, "pending=", pos["liquidity_pending_quantity"])
         pos["opening_confirmed"] = True
         return
     if not submit_qmt_order(ContextInfo, "buy", pos["code"], quantity, fill_price, quote):
         pos["opening_confirmed"] = True
         return
-    old_quantity = pos["quantity"]
-    old_cost = pos.get("avg_fill_price", pos["avg_price"]) * old_quantity * pos["multiplier"]
-    ContextInfo.cash -= premium + fee
-    pos["quantity"] += quantity
-    pos["initial_quantity"] += quantity
-    pos["avg_price"] = weighted_mid
-    pos["avg_fill_price"] = (old_cost + premium) / float(pos["quantity"] * pos["multiplier"])
-    pos["total_buy"] += premium
-    pos["total_fees"] += fee
+    apply_buy_fill_to_position(ContextInfo, pos, quantity, fill_price, execution_price)
     pos["opening_confirmed"] = True
-    pos["high_water"] = max(pos["high_water"], fill_price)
-    log("ADD", now_text, pos["code"], "qty=", quantity, "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "new_qty=", pos["quantity"], "avg=", round(pos["avg_price"], 6), "avg_fill=", round(pos["avg_fill_price"], 6))
+    pos["liquidity_pending_quantity"] = max(0, pos.get("liquidity_target_quantity", target_qty) - pos["quantity"])
+    log("ADD", now_text, pos["code"], "qty=", quantity, "target=", target_qty, "pending=", pos["liquidity_pending_quantity"], "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "new_qty=", pos["quantity"], "avg=", round(pos["avg_price"], 6), "avg_fill=", round(pos["avg_fill_price"], 6))
+    log("ORDER_EXECUTION_SUMMARY", "opening_confirm_add", "time=", now_text, "code=", pos["code"], "target=", target_qty, "submitted=", quantity, "pending=", pos["liquidity_pending_quantity"], "limit=", execution_price, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "new_shadow_qty=", pos["quantity"], "note=", "compare_with_QMT_deal_panel")
+
+
+def paper_add_liquidity_pending(ContextInfo, now_text, time_text, fill_price):
+    pos = ContextInfo.position
+    if pos is None or not pos.get("liquidity_add_enabled", False):
+        return False
+    if pos.get("partial_done"):
+        return False
+    if pos.get("last_liquidity_add_bar") == now_text:
+        return False
+    target_qty = safe_int(pos.get("liquidity_target_quantity", 0))
+    pending = max(0, target_qty - pos["quantity"])
+    if pending <= 0:
+        pos["liquidity_pending_quantity"] = 0
+        return False
+    eod_time = PUT_REV_EOD_TIME if pos["path"] == "put_reversal_0945" else NORMAL_EOD_TIME
+    if time_text >= eod_time:
+        return False
+    if fill_price > pos["first_price"] * QMT_LIQUIDITY_ADD_MAX_PRICE_FACTOR:
+        log("LIQUIDITY_ADD_SKIPPED_PRICE", now_text, pos["code"], "price=", round(fill_price, 6), "first=", round(pos["first_price"], 6), "pending=", pending)
+        return False
+    if QMT_LIQUIDITY_ADD_REQUIRE_SIGNAL_ALIVE:
+        if pos["path"] == "opening" and not pos.get("opening_confirmed"):
+            log("LIQUIDITY_ADD_WAIT", now_text, pos["code"], "pending=", pending, "reason=", "opening_not_confirmed")
+            return False
+        if fill_price < pos["avg_price"] * QMT_LIQUIDITY_ADD_MIN_PRICE_FACTOR:
+            log("LIQUIDITY_ADD_WAIT", now_text, pos["code"], "pending=", pending, "reason=", "option_price_weak", "price=", round(fill_price, 6), "avg=", round(pos["avg_price"], 6))
+            return False
+    quote = build_order_quote(ContextInfo, "buy", pos["code"], fill_price)
+    quote["multiplier"] = pos["multiplier"]
+    execution_price = quote.get("order_price")
+    if execution_price is None or execution_price <= 0:
+        return False
+    desired = affordable_quantity(ContextInfo, execution_price, pos["multiplier"], pending)
+    quantity, desired_quantity = cap_quantity_by_liquidity("buy", desired, quote, "liquidity_continue_add")
+    if quantity <= 0:
+        pos["liquidity_pending_quantity"] = pending
+        log("LIQUIDITY_ADD_WAIT", now_text, pos["code"], "pending=", pending, "desired=", desired_quantity, "liq_qty=", quote.get("liquidity_qty"))
+        return False
+    if not submit_qmt_order(ContextInfo, "buy", pos["code"], quantity, fill_price, quote):
+        return False
+    apply_buy_fill_to_position(ContextInfo, pos, quantity, fill_price, execution_price)
+    pos["last_liquidity_add_bar"] = now_text
+    pos["liquidity_pending_quantity"] = max(0, target_qty - pos["quantity"])
+    log("LIQUIDITY_ADD", now_text, pos["code"], "qty=", quantity, "target=", target_qty, "pending=", pos["liquidity_pending_quantity"], "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "new_qty=", pos["quantity"], "avg=", round(pos["avg_price"], 6), "avg_fill=", round(pos["avg_fill_price"], 6))
+    log("ORDER_EXECUTION_SUMMARY", "liquidity_continue_add", "time=", now_text, "code=", pos["code"], "target=", target_qty, "submitted=", quantity, "pending=", pos["liquidity_pending_quantity"], "limit=", execution_price, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "new_shadow_qty=", pos["quantity"], "note=", "compare_with_QMT_deal_panel")
+    return True
 
 
 def paper_sell(ContextInfo, now_text, quantity, fill_price, reason):
@@ -1029,6 +1389,7 @@ def paper_sell(ContextInfo, now_text, quantity, fill_price, reason):
     if quantity <= 0:
         return
     quote = build_order_quote(ContextInfo, "sell", pos["code"], fill_price)
+    quote["multiplier"] = pos["multiplier"]
     execution_price = quote.get("order_price")
     if execution_price is None or execution_price <= 0:
         log("SELL_ABORTED_BAD_PRICE", now_text, pos["code"], reason)
@@ -1043,6 +1404,7 @@ def paper_sell(ContextInfo, now_text, quantity, fill_price, reason):
     pos["total_sell"] += proceeds
     pos["total_fees"] += fee
     log("SELL", now_text, pos["code"], "qty=", quantity, "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "reason=", reason, "remaining=", pos["quantity"], "cash=", round(ContextInfo.cash, 2))
+    log("ORDER_EXECUTION_SUMMARY", "sell_close", "time=", now_text, "code=", pos["code"], "submitted=", quantity, "remaining=", pos["quantity"], "limit=", execution_price, "reason=", reason, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "expected_amount=", round(proceeds, 2), "expected_fee=", round(fee, 2), "note=", "compare_with_QMT_deal_panel")
     if pos["quantity"] <= 0:
         pnl = pos["total_sell"] - pos["total_buy"] - pos["total_fees"]
         ContextInfo.trade_count += 1
@@ -1084,6 +1446,8 @@ def manage_position(ContextInfo, now_text, time_text):
     if pos["path"] == "put_reversal_0945":
         if put_reversal_special_exit(ContextInfo, pos, price, time_text, now_text):
             return
+    if paper_add_liquidity_pending(ContextInfo, now_text, time_text, price):
+        return
     if pos["strong"]:
         if not pos["partial_done"] and price >= pos["avg_price"] * STRONG_TP1_FACTOR:
             qty = max(1, int(pos["initial_quantity"] / 3))
@@ -1399,20 +1763,29 @@ def init(ContextInfo):
         "time": "",
         "last_etf_close": None,
     }
+    ContextInfo.live_date_gate_skip_logged = False
+    ContextInfo.live_account_status_logged = False
     log("INIT", BUILD_ID, "period=", getattr(ContextInfo, "period", None))
     log("ACCOUNT", masked_account(QMT_ACCOUNT_ID), "native_order=", QMT_NATIVE_ORDER_ENABLED)
+    log("LIVE_DATE_GATE", "enabled=", LIVE_WALL_CLOCK_GATE, "target_date=", live_trade_date(), "override=", LIVE_TRADE_DATE_OVERRIDE)
     log("BBO", "use_full_tick=", QMT_USE_FULL_TICK_BBO, "require_last_bar=", QMT_BBO_REQUIRE_LAST_BAR)
     log("RISK", "initial_cash=", INITIAL_CASH, "premium_cap=", ABS_PREMIUM_CAP, "max_trades_day=", LIVE_MAX_TRADES_PER_DAY)
+    log_live_account_status(ContextInfo, "init")
 
 
 def handlebar(ContextInfo):
     now_text, current_date, time_text = current_datetime(ContextInfo)
     if current_date <= 0 or len(time_text) != 4:
         return
+    if not live_date_gate_allows(ContextInfo, now_text, current_date):
+        return
     if now_text == ContextInfo.state.get("last_bar_text", ""):
         return
     ContextInfo.state["last_bar_text"] = now_text
     ContextInfo.state["time"] = time_text
+    if not getattr(ContextInfo, "live_account_status_logged", False):
+        ContextInfo.live_account_status_logged = True
+        log_live_account_status(ContextInfo, "first_live_bar_%s" % now_text)
     if current_date != ContextInfo.current_date:
         if ContextInfo.current_date:
             update_daily_from_minute(ContextInfo, ContextInfo.current_date)
