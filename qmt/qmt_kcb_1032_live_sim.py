@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""QMT executable script for the KCB 1032.98% baseline.
+"""QMT executable script for the KCB 1606.57% baseline.
 
 Run in QMT option strategy trading on a 1-minute chart.
 
@@ -8,6 +8,8 @@ This file is intentionally conservative:
 - one strategy trade per day;
 - single-trade premium budget is min(equity * path_pct, 150000);
 - 09:45 put-reversal uses momentum ranking, then capacity fallback;
+- opening_put_fail catches opening-down weak-pullback failures;
+- liquidity-aware orders cap submitted size by current full-tick book depth;
 - native QMT orders are sent through the passorder style that was validated
   in the earlier QMT live-sim script.
 
@@ -25,7 +27,7 @@ import math
 # User configuration
 # ---------------------------------------------------------------------------
 
-BUILD_ID = "KCB_1032_LIVE_SIM_20260728_R5_LIQUIDITY_EXEC_AUDIT"
+BUILD_ID = "KCB_1606_LIVE_SIM_20260729_R7_OPENING_PUT_FAIL_P0P1"
 KCB_CODE = "588000.SH"
 UNDERLYINGS = [KCB_CODE]
 
@@ -116,6 +118,35 @@ TRAIL_AFTER_1030 = 0.20
 PUT_REV_TREND_QUICK_TP = 1.10
 PUT_REV_NO_FOLLOW_HIGH = 1.05
 PUT_REV_NO_FOLLOW_CLOSE = 0.97
+PUT_REV_HOLD_WINNER_ENABLED = True
+PUT_REV_HOLD_TRIGGER_FACTOR = 1.35
+PUT_REV_HOLD_SCALE_FACTOR = 1.50
+PUT_REV_HOLD_SCALE_RATIO = 1.0 / 3.0
+PUT_REV_HOLD_TRAIL = 0.12
+PUT_REV_HOLD_CLOSE_NEAR_HIGH = 0.92
+PUT_REV_HOLD_ETF_FOLLOW_MIN = 0.0
+PUT_REV_HOLD_LATEST_TRIGGER_TIME = "1430"
+
+OPENING_PUT_FAIL_ENABLED = True
+OPENING_PUT_FAIL_POSITION = 0.25
+OPENING_PUT_FAIL_POSITION_CAP = 25000.0
+OPENING_PUT_FAIL_ETF_DOWN_MIN = 0.006
+OPENING_PUT_FAIL_CLOSE_POS_MAX = 0.35
+OPENING_PUT_FAIL_SCAN_START = "0946"
+OPENING_PUT_FAIL_SCAN_END = "1000"
+OPENING_PUT_FAIL_MAX_REBOUND = 0.005
+OPENING_PUT_FAIL_BREAK_CONFIRM = 0.001
+OPENING_PUT_FAIL_MIN_PRICE = 0.03
+OPENING_PUT_FAIL_MIN_VOLUME15 = 1000.0
+OPENING_PUT_FAIL_MAX_VOLUME_SHARE = 0.05
+OPENING_PUT_FAIL_DELTA_MIN = 0.45
+OPENING_PUT_FAIL_DELTA_MAX = 0.60
+OPENING_PUT_FAIL_STOP_FACTOR = 0.88
+OPENING_PUT_FAIL_TP1_FACTOR = 1.25
+OPENING_PUT_FAIL_TP2_FACTOR = 1.45
+OPENING_PUT_FAIL_TRAIL = 0.12
+OPENING_PUT_FAIL_EOD_TIME = "1445"
+
 PUT_REV_EOD_TIME = "1445"
 NORMAL_EOD_TIME = "1455"
 
@@ -1143,6 +1174,110 @@ def select_put_reversal(ContextInfo, spot, time_text):
     return selected
 
 
+def opening_put_fail_stats(ContextInfo):
+    etf_bars = ContextInfo.state["bars"].get(KCB_CODE, [])
+    first15 = bars_between(etf_bars, "0930", "0945")
+    open_bar = first_bar(etf_bars)
+    bar945 = last_bar_at_or_before(etf_bars, "0945")
+    if not first15 or open_bar is None or bar945 is None or open_bar["open"] <= 0:
+        return None
+    high15 = max(row["high"] for row in first15)
+    low15 = min(row["low"] for row in first15)
+    width = high15 - low15
+    close945 = bar945["close"]
+    close_pos = (close945 - low15) / width if width > 0 else 0.5
+    etf_return = close945 / open_bar["open"] - 1.0
+    return {
+        "open": open_bar["open"],
+        "close945": close945,
+        "high15": high15,
+        "low15": low15,
+        "close_pos": close_pos,
+        "return945": etf_return,
+    }
+
+
+def opening_put_fail_trigger_ok(ContextInfo, time_text):
+    stats = opening_put_fail_stats(ContextInfo)
+    if stats is None:
+        return False, None
+    if stats["return945"] > -OPENING_PUT_FAIL_ETF_DOWN_MIN:
+        return False, stats
+    if stats["close_pos"] > OPENING_PUT_FAIL_CLOSE_POS_MAX:
+        return False, stats
+    etf_bars = ContextInfo.state["bars"].get(KCB_CODE, [])
+    path = [row for row in etf_bars if row["time"] > "0945" and row["time"] <= time_text]
+    if not path:
+        return False, stats
+    max_rebound = max(row["high"] for row in path) / stats["close945"] - 1.0 if stats["close945"] > 0 else 999.0
+    if max_rebound > OPENING_PUT_FAIL_MAX_REBOUND:
+        stats["max_rebound"] = max_rebound
+        return False, stats
+    last = last_bar_at_or_before(etf_bars, time_text)
+    if last is None:
+        return False, stats
+    trigger_level = stats["close945"] * (1.0 - OPENING_PUT_FAIL_BREAK_CONFIRM)
+    stats["max_rebound"] = max_rebound
+    stats["trigger_level"] = trigger_level
+    stats["last_close"] = last["close"]
+    if last["close"] > trigger_level:
+        return False, stats
+    return True, stats
+
+
+def select_opening_put_fail(ContextInfo, spot, time_text):
+    candidates = []
+    rejects = {"dte": 0, "price": 0, "iv": 0, "delta": 0, "volume15": 0, "capacity": 0}
+    budget = min(paper_equity(ContextInfo) * OPENING_PUT_FAIL_POSITION, OPENING_PUT_FAIL_POSITION_CAP, ABS_PREMIUM_CAP)
+    for item in ContextInfo.state.get("universe", []):
+        if item["type"] != "PUT":
+            continue
+        if item["dte"] < DTE_MIN or item["dte"] > DTE_MAX:
+            rejects["dte"] += 1
+            continue
+        snap = get_option_snapshot(ContextInfo, item, spot, time_text)
+        if snap is None:
+            rejects["iv"] += 1
+            continue
+        if snap["price"] < OPENING_PUT_FAIL_MIN_PRICE:
+            rejects["price"] += 1
+            continue
+        if abs(snap["delta"]) < OPENING_PUT_FAIL_DELTA_MIN or abs(snap["delta"]) > OPENING_PUT_FAIL_DELTA_MAX:
+            rejects["delta"] += 1
+            continue
+        if snap["volume15"] < OPENING_PUT_FAIL_MIN_VOLUME15:
+            rejects["volume15"] += 1
+            continue
+        open_bar = first_bar(snap["bars"])
+        momentum = snap["price"] / open_bar["open"] - 1.0 if open_bar and open_bar["open"] > 0 else 0.0
+        planned = int(budget / float((snap["price"] + QMT_BUY_LIMIT_BUFFER) * snap["multiplier"]))
+        cap_limit = snap["volume15"] * OPENING_PUT_FAIL_MAX_VOLUME_SHARE
+        snap["momentum_to_entry"] = momentum
+        snap["planned_qty"] = planned
+        snap["cap_limit"] = cap_limit
+        snap["capacity_ok"] = planned > 0 and planned <= cap_limit
+        if not snap["capacity_ok"]:
+            rejects["capacity"] += 1
+            continue
+        score = (
+            -abs(abs(snap["delta"]) - 0.50) * 10.0
+            - abs(snap["dte"] - 20) * 0.02
+            + math.log(max(snap["volume15"], 1.0)) * 0.05
+            + momentum
+        )
+        snap["score"] = score
+        candidates.append(snap)
+    candidates.sort(key=lambda row: row["score"], reverse=True)
+    log("OPENPUTFAIL_REJECTS", repr(rejects), "candidates=", len(candidates))
+    for row in candidates[:5]:
+        log("OPENPUTFAIL_CAND", row["code"], "strike=", row["strike"], "price=", round(row["price"], 6), "delta=", round(row["delta"], 4), "iv=", round(row["iv"], 4), "vol15=", round(row["volume15"], 2), "mom=", round(row["momentum_to_entry"], 6), "planned=", row.get("planned_qty"), "cap=", round(row.get("cap_limit", 0), 2), "score=", round(row.get("score", 0), 4))
+    if candidates:
+        log("OPENPUTFAIL_SELECTED", candidates[0]["code"], "reason=", "pullback_fail_score_capacity")
+        return candidates[0]
+    log("OPENPUTFAIL_SELECTED", "NONE")
+    return None
+
+
 def paper_equity(ContextInfo):
     equity = ContextInfo.cash
     pos = ContextInfo.position
@@ -1156,6 +1291,8 @@ def paper_equity(ContextInfo):
 def position_pct(path, strong, iv):
     if path == "put_reversal_0945":
         return PUT_REV_POSITION
+    if path == "opening_put_fail":
+        return OPENING_PUT_FAIL_POSITION
     if path == "opening":
         return OPENING_STRONG_POSITION if strong else OPENING_NORMAL_POSITION
     if path == "fallback_high_iv_put":
@@ -1231,6 +1368,8 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
     pct = position_pct(path, strong, selected.get("iv"))
     equity = paper_equity(ContextInfo)
     target_cost = min(equity * pct, ABS_PREMIUM_CAP)
+    if path == "opening_put_fail":
+        target_cost = min(target_cost, OPENING_PUT_FAIL_POSITION_CAP)
     buy_budget = target_cost * allocation_factor
     quote = build_order_quote(ContextInfo, "buy", selected["code"], fill_price)
     quote["multiplier"] = selected["multiplier"]
@@ -1285,6 +1424,11 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
         "liquidity_pending_quantity": max(0, target_quantity - quantity),
         "liquidity_add_enabled": QMT_LIQUIDITY_CONTINUE_ADD,
         "last_liquidity_add_bar": "",
+        "put_rev_hold_mode": False,
+        "put_rev_hold_scale_done": False,
+        "put_rev_hold_trailing_stop": None,
+        "opening_put_fail_trailing_stop": None,
+        "opening_put_fail_hold_mode": False,
     }
     ContextInfo.day_locked = True
     ContextInfo.day_entries += 1
@@ -1347,7 +1491,12 @@ def paper_add_liquidity_pending(ContextInfo, now_text, time_text, fill_price):
     if pending <= 0:
         pos["liquidity_pending_quantity"] = 0
         return False
-    eod_time = PUT_REV_EOD_TIME if pos["path"] == "put_reversal_0945" else NORMAL_EOD_TIME
+    if pos["path"] == "put_reversal_0945":
+        eod_time = PUT_REV_EOD_TIME
+    elif pos["path"] == "opening_put_fail":
+        eod_time = OPENING_PUT_FAIL_EOD_TIME
+    else:
+        eod_time = NORMAL_EOD_TIME
     if time_text >= eod_time:
         return False
     if fill_price > pos["first_price"] * QMT_LIQUIDITY_ADD_MAX_PRICE_FACTOR:
@@ -1439,6 +1588,9 @@ def manage_position(ContextInfo, now_text, time_text):
     if price <= pos["avg_price"] * HARD_STOP_FACTOR:
         paper_sell(ContextInfo, now_text, pos["quantity"], price, "hard_stop_70%")
         return
+    if pos["path"] == "opening_put_fail":
+        if manage_opening_put_fail(ContextInfo, pos, price, time_text, now_text):
+            return
     soft = PUT_REV_SOFT_STOP_FACTOR if pos["path"] == "put_reversal_0945" else (OPENING_SOFT_STOP_FACTOR if pos["path"] == "opening" else FALLBACK_SOFT_STOP_FACTOR)
     if minutes_since_entry(pos, now_text) >= SOFT_STOP_DELAY_MINUTES and price <= pos["avg_price"] * soft:
         paper_sell(ContextInfo, now_text, pos["quantity"], price, "soft_stop")
@@ -1447,6 +1599,8 @@ def manage_position(ContextInfo, now_text, time_text):
         if put_reversal_special_exit(ContextInfo, pos, price, time_text, now_text):
             return
     if paper_add_liquidity_pending(ContextInfo, now_text, time_text, price):
+        return
+    if manage_put_reversal_hold_winner(ContextInfo, pos, price, time_text, now_text):
         return
     if pos["strong"]:
         if not pos["partial_done"] and price >= pos["avg_price"] * STRONG_TP1_FACTOR:
@@ -1470,7 +1624,12 @@ def manage_position(ContextInfo, now_text, time_text):
         if pos["partial_done"] and price >= pos["avg_price"] * NORMAL_TP2_FACTOR:
             paper_sell(ContextInfo, now_text, pos["quantity"], price, "normal_tp2_300%")
             return
-    eod_time = PUT_REV_EOD_TIME if pos["path"] == "put_reversal_0945" else NORMAL_EOD_TIME
+    if pos["path"] == "put_reversal_0945":
+        eod_time = PUT_REV_EOD_TIME
+    elif pos["path"] == "opening_put_fail":
+        eod_time = OPENING_PUT_FAIL_EOD_TIME
+    else:
+        eod_time = NORMAL_EOD_TIME
     if time_text >= eod_time:
         paper_sell(ContextInfo, now_text, pos["quantity"], price, "eod_%s" % eod_time)
 
@@ -1490,6 +1649,146 @@ def put_reversal_special_exit(ContextInfo, pos, price, time_text, now_text):
             paper_sell(ContextInfo, now_text, pos["quantity"], price, "early_no_follow_1030")
             return True
     return False
+
+
+def manage_opening_put_fail(ContextInfo, pos, price, time_text, now_text):
+    if pos.get("path") != "opening_put_fail":
+        return False
+    avg_price = safe_float(pos.get("avg_price"))
+    if avg_price is None or avg_price <= 0:
+        return True
+
+    if price <= avg_price * OPENING_PUT_FAIL_STOP_FACTOR:
+        paper_sell(ContextInfo, now_text, pos["quantity"], price, "opening_put_fail_fast_stop_12%")
+        return True
+
+    if time_text >= OPENING_PUT_FAIL_EOD_TIME:
+        paper_sell(ContextInfo, now_text, pos["quantity"], price, "opening_put_fail_eod_%s" % OPENING_PUT_FAIL_EOD_TIME)
+        return True
+
+    if paper_add_liquidity_pending(ContextInfo, now_text, time_text, price):
+        return True
+
+    high_water = safe_float(pos.get("high_water"), price)
+    trail_stop = max(
+        safe_float(pos.get("opening_put_fail_trailing_stop"), avg_price * OPENING_PUT_FAIL_STOP_FACTOR),
+        high_water * (1.0 - OPENING_PUT_FAIL_TRAIL),
+        avg_price * OPENING_PUT_FAIL_STOP_FACTOR,
+    )
+
+    if pos.get("opening_put_fail_hold_mode", False):
+        pos["opening_put_fail_trailing_stop"] = trail_stop
+        if price <= trail_stop:
+            paper_sell(ContextInfo, now_text, pos["quantity"], price, "opening_put_fail_strong_trailing_%d%%" % int(OPENING_PUT_FAIL_TRAIL * 100))
+        return True
+
+    if not pos.get("partial_done", False) and price >= avg_price * OPENING_PUT_FAIL_TP1_FACTOR:
+        if price >= avg_price * OPENING_PUT_FAIL_TP2_FACTOR:
+            pos["opening_put_fail_hold_mode"] = True
+            pos["opening_put_fail_trailing_stop"] = trail_stop
+            log(
+                "OPENPUTFAIL_HOLD_MODE",
+                now_text,
+                pos["code"],
+                "price=", round(price, 6),
+                "avg=", round(avg_price, 6),
+                "high_water=", round(high_water, 6),
+                "trail=", OPENING_PUT_FAIL_TRAIL,
+                "reason=", "fast_strong_put_skip_half",
+            )
+            return True
+        qty = max(1, int(pos["initial_quantity"] * 0.5))
+        paper_sell(ContextInfo, now_text, qty, price, "opening_put_fail_tp25_sell_half")
+        if ContextInfo.position is not None:
+            ContextInfo.position["partial_done"] = True
+        return True
+
+    if pos.get("partial_done", False) and price >= avg_price * OPENING_PUT_FAIL_TP2_FACTOR:
+        paper_sell(ContextInfo, now_text, pos["quantity"], price, "opening_put_fail_tp45")
+        return True
+
+    return True
+
+
+def put_reversal_hold_winner_context_ok(ContextInfo, pos, price, time_text):
+    if time_text >= PUT_REV_HOLD_LATEST_TRIGGER_TIME:
+        return False
+    high_water = safe_float(pos.get("high_water"))
+    avg_price = safe_float(pos.get("avg_price"))
+    if high_water is None or high_water <= 0 or avg_price is None or avg_price <= 0:
+        return False
+    if price < high_water * PUT_REV_HOLD_CLOSE_NEAR_HIGH:
+        return False
+    if price < avg_price * PUT_REV_HOLD_TRIGGER_FACTOR:
+        return False
+    entry_etf = safe_float(pos.get("entry_etf"))
+    current_etf = safe_float(ContextInfo.state.get("last_etf_close"))
+    if entry_etf is not None and entry_etf > 0 and current_etf is not None and PUT_REV_HOLD_ETF_FOLLOW_MIN is not None:
+        if current_etf > entry_etf * (1.0 - PUT_REV_HOLD_ETF_FOLLOW_MIN):
+            return False
+    return True
+
+
+def manage_put_reversal_hold_winner(ContextInfo, pos, price, time_text, now_text):
+    if not PUT_REV_HOLD_WINNER_ENABLED:
+        return False
+    if pos.get("path") != "put_reversal_0945":
+        return False
+    if pos.get("partial_done") and not pos.get("put_rev_hold_mode"):
+        return False
+    avg_price = safe_float(pos.get("avg_price"))
+    if avg_price is None or avg_price <= 0:
+        return False
+
+    if not pos.get("put_rev_hold_mode", False):
+        if pos.get("partial_done"):
+            return False
+        if price < avg_price * PUT_REV_HOLD_TRIGGER_FACTOR:
+            return False
+        if not put_reversal_hold_winner_context_ok(ContextInfo, pos, price, time_text):
+            return False
+        pos["put_rev_hold_mode"] = True
+        pos["put_rev_hold_trailing_stop"] = max(
+            avg_price * HARD_STOP_FACTOR,
+            safe_float(pos.get("high_water"), price) * (1.0 - PUT_REV_HOLD_TRAIL),
+        )
+        log(
+            "PUTREV_HOLD_MODE",
+            now_text,
+            pos["code"],
+            "price=", round(price, 6),
+            "avg=", round(avg_price, 6),
+            "high_water=", round(pos.get("high_water"), 6) if pos.get("high_water") is not None else None,
+            "trail=", PUT_REV_HOLD_TRAIL,
+            "scale_factor=", PUT_REV_HOLD_SCALE_FACTOR,
+            "reason=", "strong_context_skip_35pct_half",
+        )
+
+    if time_text >= PUT_REV_EOD_TIME:
+        paper_sell(ContextInfo, now_text, pos["quantity"], price, "putrev_hold_eod_%s" % PUT_REV_EOD_TIME)
+        return True
+
+    trail_stop = max(
+        safe_float(pos.get("put_rev_hold_trailing_stop"), avg_price * HARD_STOP_FACTOR),
+        safe_float(pos.get("high_water"), price) * (1.0 - PUT_REV_HOLD_TRAIL),
+        avg_price * HARD_STOP_FACTOR,
+    )
+    pos["put_rev_hold_trailing_stop"] = trail_stop
+
+    if not pos.get("put_rev_hold_scale_done", False) and price >= avg_price * PUT_REV_HOLD_SCALE_FACTOR:
+        qty = max(1, int(pos["initial_quantity"] * PUT_REV_HOLD_SCALE_RATIO + 0.5))
+        qty = min(qty, pos["quantity"])
+        paper_sell(ContextInfo, now_text, qty, price, "putrev_hold_scale_50pct_sell_1_3")
+        if ContextInfo.position is not None:
+            ContextInfo.position["put_rev_hold_scale_done"] = True
+            ContextInfo.position["partial_done"] = True
+        return True
+
+    if price <= trail_stop:
+        paper_sell(ContextInfo, now_text, pos["quantity"], price, "putrev_hold_trailing_%d%%" % int(PUT_REV_HOLD_TRAIL * 100))
+        return True
+
+    return True
 
 
 def aggregate_15m(etf_bars):
@@ -1724,6 +2023,39 @@ def evaluate_put_reversal(ContextInfo, now_text, time_text):
     paper_open(ContextInfo, selected, "put", "put_reversal_0945", False, now_text, selected["price"], 1.0)
 
 
+def evaluate_opening_put_fail(ContextInfo, now_text, time_text):
+    if not OPENING_PUT_FAIL_ENABLED:
+        return
+    if time_text < OPENING_PUT_FAIL_SCAN_START or time_text > OPENING_PUT_FAIL_SCAN_END:
+        return
+    if ContextInfo.day_locked or ContextInfo.position is not None:
+        return
+    ok, stats = opening_put_fail_trigger_ok(ContextInfo, time_text)
+    if stats is not None and time_text == OPENING_PUT_FAIL_SCAN_START:
+        log(
+            "OPENPUTFAIL_BASE",
+            "open=", round(stats.get("open"), 6) if stats.get("open") is not None else None,
+            "close945=", round(stats.get("close945"), 6) if stats.get("close945") is not None else None,
+            "return945=", round(stats.get("return945"), 6) if stats.get("return945") is not None else None,
+            "close_pos=", round(stats.get("close_pos"), 4) if stats.get("close_pos") is not None else None,
+        )
+    if not ok:
+        return
+    log(
+        "OPENPUTFAIL_TRIGGER",
+        now_text,
+        "return945=", round(stats.get("return945"), 6) if stats else None,
+        "close_pos=", round(stats.get("close_pos"), 4) if stats else None,
+        "max_rebound=", round(stats.get("max_rebound"), 6) if stats and stats.get("max_rebound") is not None else None,
+        "last_close=", round(stats.get("last_close"), 6) if stats and stats.get("last_close") is not None else None,
+        "trigger_level=", round(stats.get("trigger_level"), 6) if stats and stats.get("trigger_level") is not None else None,
+    )
+    selected = select_opening_put_fail(ContextInfo, ContextInfo.state.get("last_etf_close"), time_text)
+    if selected is None:
+        return
+    paper_open(ContextInfo, selected, "put", "opening_put_fail", True, now_text, selected["price"], 1.0)
+
+
 def update_daily_from_minute(ContextInfo, current_date):
     etf_bars = ContextInfo.state["bars"].get(KCB_CODE, [])
     if not etf_bars:
@@ -1818,6 +2150,8 @@ def handlebar(ContextInfo):
         evaluate_opening(ContextInfo, now_text, time_text)
     if ContextInfo.position is None:
         evaluate_put_reversal(ContextInfo, now_text, time_text)
+    if ContextInfo.position is None:
+        evaluate_opening_put_fail(ContextInfo, now_text, time_text)
     if ContextInfo.position is None:
         evaluate_fallback(ContextInfo, now_text, time_text)
     if time_text >= "1459":
