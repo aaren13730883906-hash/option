@@ -27,7 +27,7 @@ import math
 # User configuration
 # ---------------------------------------------------------------------------
 
-BUILD_ID = "KCB_1606_LIVE_SIM_20260804_R11_REJECTED_ORDER_NO_SHADOW_FILL"
+BUILD_ID = "KCB_1606_LIVE_SIM_20260804_R12_ASCII_REJECT_CHECK"
 KCB_CODE = "588000.SH"
 UNDERLYINGS = [KCB_CODE]
 
@@ -543,14 +543,9 @@ def order_object_reject_reason(obj):
     if obj is None:
         return None
     parts = []
-    for field_name in [
-        "m_strCancelInfo",
-        "m_strErrMsg",
-        "m_strErrorMsg",
-        "m_strStatusMsg",
-        "m_strOrderStatus",
-        "m_strOrderSubmitStatus",
-    ]:
+    hard_reject_fields = ["m_strCancelInfo", "m_strErrMsg", "m_strErrorMsg"]
+    soft_status_fields = ["m_strStatusMsg", "m_strOrderStatus", "m_strOrderSubmitStatus"]
+    for field_name in hard_reject_fields + soft_status_fields:
         try:
             value = getattr(obj, field_name)
             if value is not None and str(value).strip() not in ["", "0", "None"]:
@@ -560,19 +555,23 @@ def order_object_reject_reason(obj):
     text = " ".join(parts)
     if not text:
         return None
+    for field_name in hard_reject_fields:
+        marker = field_name + "="
+        if marker in text:
+            return text
     reject_words = [
         "COUNTER",
-        "错误",
-        "禁止",
-        "废",
-        "拒",
-        "撤",
-        "停牌",
-        "失败",
+        "STKB",
+        "Reject",
+        "Rejected",
+        "reject",
+        "rejected",
         "Error",
         "error",
         "Cancel",
         "cancel",
+        "Failed",
+        "failed",
     ]
     for word in reject_words:
         if word in text:
