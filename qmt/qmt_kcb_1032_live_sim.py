@@ -27,7 +27,7 @@ import math
 # User configuration
 # ---------------------------------------------------------------------------
 
-BUILD_ID = "KCB_1606_LIVE_SIM_20260729_R7_OPENING_PUT_FAIL_P0P1"
+BUILD_ID = "KCB_1606_LIVE_SIM_20260804_R11_REJECTED_ORDER_NO_SHADOW_FILL"
 KCB_CODE = "588000.SH"
 UNDERLYINGS = [KCB_CODE]
 
@@ -46,11 +46,13 @@ QMT_ORDER_CODE_WITH_SUFFIX = True
 QMT_PASSORDER_STYLE = "official9"
 QMT_STRATEGY_NAME = "kcb_1032_live_sim"
 QMT_QUICK_TRADE = 1
+QMT_QUERY_ACCOUNT_TYPE_TEXT = "STOCK_OPTION"
+QMT_QUERY_USE_STRATEGY_FILTER = False
 QMT_PRICE_TICK = 0.0001
 QMT_BUY_LIMIT_BUFFER = 0.0003
 QMT_SELL_LIMIT_BUFFER = 0.0003
 QMT_USE_FULL_TICK_BBO = True
-QMT_BBO_REQUIRE_LAST_BAR = True
+QMT_BBO_REQUIRE_LAST_BAR = False
 QMT_BBO_MIN_ASK_VOL = 1.0
 QMT_BBO_MIN_BID_VOL = 1.0
 QMT_LIQUIDITY_AWARE_ORDER = True
@@ -61,6 +63,8 @@ QMT_LIQUIDITY_ADD_MAX_PRICE_FACTOR = 1.03
 QMT_LIQUIDITY_ADD_MIN_PRICE_FACTOR = 0.98
 QMT_LIQUIDITY_ADD_REQUIRE_SIGNAL_ALIVE = True
 QMT_LOG_TRADE_DETAIL_AFTER_ORDER = True
+QMT_LOG_LAST_ORDER_BY_ID_AFTER_ORDER = True
+QMT_VERBOSE_SIGNAL_LOG = False
 
 LIVE_MAX_TRADES_PER_DAY = 1
 LIVE_MAX_CONTRACTS = 0
@@ -224,6 +228,9 @@ KCB_DAILY_SEED = [
 
 
 RUNTIME_ORDER_KEYS = set()
+RUNTIME_MINUTE_ORDER_KEYS = set()
+RUNTIME_OPEN_LOCK_DATES = set()
+RUNTIME_SIGNAL_LOG_KEYS = set()
 
 
 def log(*items):
@@ -419,8 +426,8 @@ def live_date_gate_allows(ContextInfo, now_text, current_date):
 
 def read_native_account_snapshot():
     attempts = [
-        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, "account"),
-        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, "account", QMT_STRATEGY_NAME),
+        (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), "account"),
+        (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), "account", QMT_STRATEGY_NAME),
     ]
     for args in attempts:
         try:
@@ -432,8 +439,8 @@ def read_native_account_snapshot():
 
 def read_native_trade_detail(kind):
     attempts = [
-        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, kind),
-        (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, kind, QMT_STRATEGY_NAME),
+        (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), kind),
+        (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), kind, QMT_STRATEGY_NAME),
     ]
     last_error = None
     for args in attempts:
@@ -450,6 +457,162 @@ def log_trade_detail_snapshots(ContextInfo, label):
     for kind in ["order", "deal", "position", "account"]:
         ok, data = read_native_trade_detail(kind)
         log("TRADE_DETAIL", label, "kind=", kind, "ok=", ok, "data=", short_repr(data))
+
+
+def log_order_object_fields(label, datatype, obj):
+    if obj is None:
+        log(datatype + "_BY_ID", label, "obj=", None)
+        return
+    field_names = [
+        "m_strInstrumentID",
+        "m_strOrderSysID",
+        "m_strOrderRef",
+        "m_strOrderStatus",
+        "m_strStatusMsg",
+        "m_strCancelInfo",
+        "m_strCancelTime",
+        "m_strErrMsg",
+        "m_strErrorMsg",
+        "m_strOrderLocalID",
+        "m_strOrderSubmitStatus",
+        "m_strDirection",
+        "m_strOffsetFlag",
+        "m_nDirection",
+        "m_nOffsetFlag",
+        "m_nOrderStatus",
+        "m_nOrderSubmitStatus",
+        "m_nVolumeTotalOriginal",
+        "m_nVolumeTraded",
+        "m_nVolumeTotal",
+        "m_dLimitPrice",
+        "m_dTradePrice",
+        "m_dTradeAmount",
+        "m_strInsertDate",
+        "m_strInsertTime",
+        "m_strTradeDate",
+        "m_strTradeTime",
+    ]
+    values = []
+    for field_name in field_names:
+        try:
+            value = getattr(obj, field_name)
+            values.append("%s=%s" % (field_name, short_repr(value, 80)))
+        except Exception:
+            pass
+    log(datatype + "_BY_ID", label, "obj=", short_repr(obj, 240), "fields=", " ".join(values))
+
+
+def log_last_order_by_id(ContextInfo, label):
+    if not QMT_LOG_LAST_ORDER_BY_ID_AFTER_ORDER:
+        return
+    account_id = getattr(ContextInfo, "live_account_id", QMT_ACCOUNT_ID)
+    for datatype in ["ORDER", "DEAL"]:
+        order_id = None
+        if not QMT_QUERY_USE_STRATEGY_FILTER:
+            try:
+                order_id = get_last_order_id(account_id, QMT_QUERY_ACCOUNT_TYPE_TEXT, datatype)
+                log("LAST_" + datatype + "_ID", label, "strategy=", "ALL", "id=", short_repr(order_id))
+            except Exception as exc:
+                log("LAST_" + datatype + "_ID_ERROR", label, "strategy=", "ALL", "error=", repr(exc))
+        if order_id is None or str(order_id) == "-1":
+            try:
+                order_id = get_last_order_id(account_id, QMT_QUERY_ACCOUNT_TYPE_TEXT, datatype, QMT_STRATEGY_NAME)
+                log("LAST_" + datatype + "_ID", label, "strategy=", QMT_STRATEGY_NAME, "id=", short_repr(order_id))
+            except Exception as exc:
+                log("LAST_" + datatype + "_ID_ERROR", label, "strategy=", QMT_STRATEGY_NAME, "error=", repr(exc))
+        if order_id is None or str(order_id) == "-1":
+            continue
+        try:
+            obj = get_value_by_order_id(str(order_id), account_id, QMT_QUERY_ACCOUNT_TYPE_TEXT, datatype)
+            log_order_object_fields(label, datatype, obj)
+        except Exception as exc:
+            log(datatype + "_BY_ID_ERROR", label, "id=", short_repr(order_id), "error=", repr(exc))
+
+
+def code_matches_order_object(obj, expected_code):
+    try:
+        instrument = str(getattr(obj, "m_strInstrumentID"))
+    except Exception:
+        instrument = ""
+    expected = str(expected_code)
+    expected_root = expected.split(".")[0]
+    return instrument == expected or instrument == expected_root
+
+
+def order_object_reject_reason(obj):
+    if obj is None:
+        return None
+    parts = []
+    for field_name in [
+        "m_strCancelInfo",
+        "m_strErrMsg",
+        "m_strErrorMsg",
+        "m_strStatusMsg",
+        "m_strOrderStatus",
+        "m_strOrderSubmitStatus",
+    ]:
+        try:
+            value = getattr(obj, field_name)
+            if value is not None and str(value).strip() not in ["", "0", "None"]:
+                parts.append("%s=%s" % (field_name, str(value)))
+        except Exception:
+            pass
+    text = " ".join(parts)
+    if not text:
+        return None
+    reject_words = [
+        "COUNTER",
+        "错误",
+        "禁止",
+        "废",
+        "拒",
+        "撤",
+        "停牌",
+        "失败",
+        "Error",
+        "error",
+        "Cancel",
+        "cancel",
+    ]
+    for word in reject_words:
+        if word in text:
+            return text
+    return None
+
+
+def verify_last_order_not_rejected(ContextInfo, label, expected_code):
+    account_id = getattr(ContextInfo, "live_account_id", QMT_ACCOUNT_ID)
+    order_ids = []
+    for use_strategy in [False, True]:
+        try:
+            if use_strategy:
+                order_id = get_last_order_id(account_id, QMT_QUERY_ACCOUNT_TYPE_TEXT, "ORDER", QMT_STRATEGY_NAME)
+            else:
+                order_id = get_last_order_id(account_id, QMT_QUERY_ACCOUNT_TYPE_TEXT, "ORDER")
+            if order_id is not None and str(order_id) != "-1" and str(order_id) not in order_ids:
+                order_ids.append(str(order_id))
+        except Exception as exc:
+            log("ORDER_VERIFY_ID_ERROR", label, "strategy=", use_strategy, "error=", repr(exc))
+    if not order_ids:
+        log("ORDER_VERIFY_NO_LAST_ORDER", label, "code=", expected_code, "note=", "cannot_confirm_reject")
+        return True
+    for order_id in order_ids:
+        try:
+            obj = get_value_by_order_id(order_id, account_id, QMT_QUERY_ACCOUNT_TYPE_TEXT, "ORDER")
+        except Exception as exc:
+            log("ORDER_VERIFY_OBJECT_ERROR", label, "id=", order_id, "error=", repr(exc))
+            continue
+        if not code_matches_order_object(obj, expected_code):
+            log("ORDER_VERIFY_SKIP_OTHER_CODE", label, "id=", order_id, "expected=", expected_code, "obj=", short_repr(obj, 180))
+            continue
+        reason = order_object_reject_reason(obj)
+        if reason:
+            log("ORDER_REJECTED_CONFIRMED", label, "id=", order_id, "code=", expected_code, "reason=", short_repr(reason, 300))
+            return False
+        log("ORDER_ACCEPT_NOT_REJECTED", label, "id=", order_id, "code=", expected_code, "note=", "no_reject_reason_seen")
+        return True
+    log("ORDER_VERIFY_NO_MATCHING_ORDER", label, "code=", expected_code, "ids=", repr(order_ids), "note=", "cannot_confirm_reject")
+    return True
 
 
 def log_live_account_status(ContextInfo, label):
@@ -851,7 +1014,7 @@ def log_order_expected_fill(side, code, quantity, quote, label):
 
 
 def submit_qmt_order(ContextInfo, side, code, quantity, reference_price, quote=None):
-    global RUNTIME_ORDER_KEYS
+    global RUNTIME_ORDER_KEYS, RUNTIME_MINUTE_ORDER_KEYS
     if quote is None:
         quote = build_order_quote(ContextInfo, side, code, reference_price)
     log_order_quote(side, code, quantity, quote)
@@ -868,10 +1031,15 @@ def submit_qmt_order(ContextInfo, side, code, quantity, reference_price, quote=N
             pass
     now_text, unused_date, unused_time = current_datetime(ContextInfo)
     key = (now_text, side, str(code), int(quantity))
+    minute_key = (now_text, side, str(code))
+    if minute_key in RUNTIME_MINUTE_ORDER_KEYS:
+        log("QMT_ORDER_BLOCKED", "duplicate_minute_order", repr(minute_key), "qty=", int(quantity))
+        return False
     if key in RUNTIME_ORDER_KEYS:
         log("QMT_ORDER_BLOCKED", "duplicate", repr(key))
         return False
     RUNTIME_ORDER_KEYS.add(key)
+    RUNTIME_MINUTE_ORDER_KEYS.add(minute_key)
     account_id = getattr(ContextInfo, "live_account_id", QMT_ACCOUNT_ID)
     operation = QMT_BUY_OPEN_OP if side == "buy" else QMT_SELL_CLOSE_OP
     order_code = str(code) if QMT_ORDER_CODE_WITH_SUFFIX else str(code).split(".")[0]
@@ -914,12 +1082,16 @@ def submit_qmt_order(ContextInfo, side, code, quantity, reference_price, quote=N
                 order_price,
                 int(quantity),
                 ContextInfo,
-            )
+        )
         log("PASSORDER_RETURN", repr(result))
+        log_last_order_by_id(ContextInfo, "after_passorder_%s_%s" % (side, str(code)))
         log_trade_detail_snapshots(ContextInfo, "after_passorder_%s_%s" % (side, str(code)))
+        if not verify_last_order_not_rejected(ContextInfo, "after_passorder_%s_%s" % (side, str(code)), code):
+            return False
         return True
     except Exception as exc:
         log("PASSORDER_ERROR", repr(exc))
+        log_last_order_by_id(ContextInfo, "after_passorder_error_%s_%s" % (side, str(code)))
         log_trade_detail_snapshots(ContextInfo, "after_passorder_error_%s_%s" % (side, str(code)))
         return False
 
@@ -1268,13 +1440,15 @@ def select_opening_put_fail(ContextInfo, spot, time_text):
         snap["score"] = score
         candidates.append(snap)
     candidates.sort(key=lambda row: row["score"], reverse=True)
-    log("OPENPUTFAIL_REJECTS", repr(rejects), "candidates=", len(candidates))
-    for row in candidates[:5]:
-        log("OPENPUTFAIL_CAND", row["code"], "strike=", row["strike"], "price=", round(row["price"], 6), "delta=", round(row["delta"], 4), "iv=", round(row["iv"], 4), "vol15=", round(row["volume15"], 2), "mom=", round(row["momentum_to_entry"], 6), "planned=", row.get("planned_qty"), "cap=", round(row.get("cap_limit", 0), 2), "score=", round(row.get("score", 0), 4))
+    if QMT_VERBOSE_SIGNAL_LOG:
+        log("OPENPUTFAIL_REJECTS", repr(rejects), "candidates=", len(candidates))
+        for row in candidates[:5]:
+            log("OPENPUTFAIL_CAND", row["code"], "strike=", row["strike"], "price=", round(row["price"], 6), "delta=", round(row["delta"], 4), "iv=", round(row["iv"], 4), "vol15=", round(row["volume15"], 2), "mom=", round(row["momentum_to_entry"], 6), "planned=", row.get("planned_qty"), "cap=", round(row.get("cap_limit", 0), 2), "score=", round(row.get("score", 0), 4))
     if candidates:
         log("OPENPUTFAIL_SELECTED", candidates[0]["code"], "reason=", "pullback_fail_score_capacity")
         return candidates[0]
-    log("OPENPUTFAIL_SELECTED", "NONE")
+    if QMT_VERBOSE_SIGNAL_LOG:
+        log("OPENPUTFAIL_SELECTED", "NONE")
     return None
 
 
@@ -1359,6 +1533,11 @@ def apply_buy_fill_to_position(ContextInfo, pos, quantity, fill_price, execution
 
 
 def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_price, allocation_factor):
+    global RUNTIME_OPEN_LOCK_DATES
+    current_date = safe_int(now_text[:8])
+    if current_date in RUNTIME_OPEN_LOCK_DATES:
+        log("BUY_BLOCKED", "runtime_daily_open_lock", now_text, path, selected["code"])
+        return False
     if ContextInfo.position is not None or ContextInfo.day_locked:
         log("BUY_BLOCKED", "position_or_day_locked", now_text, path)
         return False
@@ -1432,6 +1611,8 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
     }
     ContextInfo.day_locked = True
     ContextInfo.day_entries += 1
+    if current_date > 0:
+        RUNTIME_OPEN_LOCK_DATES.add(current_date)
     log("BUY", now_text, path, direction, selected["code"], "qty=", quantity, "planned=", planned_quantity, "pending=", max(0, target_quantity - quantity), "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "pct=", pct, "target_cost=", round(target_cost, 2), "iv=", round(selected.get("iv", 0), 4), "delta=", round(selected.get("delta", 0), 4), "dte=", selected.get("dte"))
     log("ORDER_EXECUTION_SUMMARY", "buy_open", "time=", now_text, "path=", path, "code=", selected["code"], "planned=", planned_quantity, "submitted=", quantity, "pending=", max(0, target_quantity - quantity), "limit=", execution_price, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "expected_amount=", round(premium, 2), "expected_fee=", round(fee, 2), "note=", "compare_with_QMT_deal_panel")
     log("SHADOW_FILL_ASSUMED", "buy", selected["code"], "qty=", quantity)
@@ -2003,6 +2184,7 @@ def evaluate_fallback(ContextInfo, now_text, time_text):
 
 
 def evaluate_put_reversal(ContextInfo, now_text, time_text):
+    global RUNTIME_SIGNAL_LOG_KEYS
     if time_text != "0945":
         return
     if ContextInfo.day_locked or ContextInfo.position is not None:
@@ -2014,7 +2196,10 @@ def evaluate_put_reversal(ContextInfo, now_text, time_text):
         return
     etf_return = last["close"] / open_bar["open"] - 1.0
     ContextInfo.state["last_etf_close"] = last["close"]
-    log("PUTREV_ETF", "open=", round(open_bar["open"], 6), "close=", round(last["close"], 6), "return=", round(etf_return, 6))
+    log_key = "putrev_etf_%s_%s" % (str(ContextInfo.current_date), time_text)
+    if QMT_VERBOSE_SIGNAL_LOG or log_key not in RUNTIME_SIGNAL_LOG_KEYS:
+        RUNTIME_SIGNAL_LOG_KEYS.add(log_key)
+        log("PUTREV_ETF", "open=", round(open_bar["open"], 6), "close=", round(last["close"], 6), "return=", round(etf_return, 6))
     if etf_return < PUT_REV_ETF_UP_MIN:
         return
     selected = select_put_reversal(ContextInfo, last["close"], "0945")
@@ -2024,6 +2209,7 @@ def evaluate_put_reversal(ContextInfo, now_text, time_text):
 
 
 def evaluate_opening_put_fail(ContextInfo, now_text, time_text):
+    global RUNTIME_SIGNAL_LOG_KEYS
     if not OPENING_PUT_FAIL_ENABLED:
         return
     if time_text < OPENING_PUT_FAIL_SCAN_START or time_text > OPENING_PUT_FAIL_SCAN_END:
@@ -2031,7 +2217,9 @@ def evaluate_opening_put_fail(ContextInfo, now_text, time_text):
     if ContextInfo.day_locked or ContextInfo.position is not None:
         return
     ok, stats = opening_put_fail_trigger_ok(ContextInfo, time_text)
-    if stats is not None and time_text == OPENING_PUT_FAIL_SCAN_START:
+    base_log_key = "opening_put_fail_base_%s" % str(ContextInfo.current_date)
+    if stats is not None and time_text == OPENING_PUT_FAIL_SCAN_START and base_log_key not in RUNTIME_SIGNAL_LOG_KEYS:
+        RUNTIME_SIGNAL_LOG_KEYS.add(base_log_key)
         log(
             "OPENPUTFAIL_BASE",
             "open=", round(stats.get("open"), 6) if stats.get("open") is not None else None,
@@ -2041,15 +2229,18 @@ def evaluate_opening_put_fail(ContextInfo, now_text, time_text):
         )
     if not ok:
         return
-    log(
-        "OPENPUTFAIL_TRIGGER",
-        now_text,
-        "return945=", round(stats.get("return945"), 6) if stats else None,
-        "close_pos=", round(stats.get("close_pos"), 4) if stats else None,
-        "max_rebound=", round(stats.get("max_rebound"), 6) if stats and stats.get("max_rebound") is not None else None,
-        "last_close=", round(stats.get("last_close"), 6) if stats and stats.get("last_close") is not None else None,
-        "trigger_level=", round(stats.get("trigger_level"), 6) if stats and stats.get("trigger_level") is not None else None,
-    )
+    trigger_log_key = "opening_put_fail_trigger_%s_%s" % (str(ContextInfo.current_date), time_text)
+    if QMT_VERBOSE_SIGNAL_LOG or trigger_log_key not in RUNTIME_SIGNAL_LOG_KEYS:
+        RUNTIME_SIGNAL_LOG_KEYS.add(trigger_log_key)
+        log(
+            "OPENPUTFAIL_TRIGGER",
+            now_text,
+            "return945=", round(stats.get("return945"), 6) if stats else None,
+            "close_pos=", round(stats.get("close_pos"), 4) if stats else None,
+            "max_rebound=", round(stats.get("max_rebound"), 6) if stats and stats.get("max_rebound") is not None else None,
+            "last_close=", round(stats.get("last_close"), 6) if stats and stats.get("last_close") is not None else None,
+            "trigger_level=", round(stats.get("trigger_level"), 6) if stats and stats.get("trigger_level") is not None else None,
+        )
     selected = select_opening_put_fail(ContextInfo, ContextInfo.state.get("last_etf_close"), time_text)
     if selected is None:
         return
@@ -2078,6 +2269,11 @@ def update_daily_from_minute(ContextInfo, current_date):
 
 
 def init(ContextInfo):
+    global RUNTIME_ORDER_KEYS, RUNTIME_MINUTE_ORDER_KEYS, RUNTIME_OPEN_LOCK_DATES, RUNTIME_SIGNAL_LOG_KEYS
+    RUNTIME_ORDER_KEYS = set()
+    RUNTIME_MINUTE_ORDER_KEYS = set()
+    RUNTIME_OPEN_LOCK_DATES = set()
+    RUNTIME_SIGNAL_LOG_KEYS = set()
     ContextInfo.live_account_id = QMT_ACCOUNT_ID
     ContextInfo.set_universe(UNDERLYINGS)
     ContextInfo.cash = INITIAL_CASH
@@ -2106,6 +2302,7 @@ def init(ContextInfo):
 
 
 def handlebar(ContextInfo):
+    global RUNTIME_SIGNAL_LOG_KEYS
     now_text, current_date, time_text = current_datetime(ContextInfo)
     if current_date <= 0 or len(time_text) != 4:
         return
@@ -2143,7 +2340,9 @@ def handlebar(ContextInfo):
         opt_bar = read_bar(ContextInfo, item["code"])
         if opt_bar is not None:
             append_bar(ContextInfo.state["bars"], item["code"], now_text, time_text, opt_bar)
-    if time_text in HEARTBEAT_MINUTES:
+    heartbeat_key = "heartbeat_%s_%s" % (str(current_date), time_text)
+    if time_text in HEARTBEAT_MINUTES and heartbeat_key not in RUNTIME_SIGNAL_LOG_KEYS:
+        RUNTIME_SIGNAL_LOG_KEYS.add(heartbeat_key)
         log("HEARTBEAT", now_text, "etf=", round(etf_bar["close"], 6), "bars=", len(ContextInfo.state["bars"].get(KCB_CODE, [])), "universe=", len(ContextInfo.state.get("universe", [])), "position=", ContextInfo.position["code"] if ContextInfo.position else "NONE", "cash=", round(ContextInfo.cash, 2), "equity=", round(paper_equity(ContextInfo), 2))
     manage_position(ContextInfo, now_text, time_text)
     if ContextInfo.position is None:
