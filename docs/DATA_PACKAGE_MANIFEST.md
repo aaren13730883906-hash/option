@@ -73,6 +73,19 @@ export OPTION_ETF_SQLITE_PATH="/新电脑路径/etf_5m_2020_202605.sqlite"
 export OPTION_ETF_1M_ROOT="/新电脑路径/1分钟_按月归档"
 ```
 
+如果新电脑是 Windows PowerShell，当前已知 ETF 1 分钟数据根目录可以先这样配置：
+
+```powershell
+$env:OPTION_ETF_1M_ROOT = 'D:\A股数据\基金_分钟数据\ETF_分钟数据\1分钟_按月归档'
+```
+
+如果 `1分钟_按月归档` 不是该路径下的实际目录，而是月份目录直接位于
+`D:\A股数据\基金_分钟数据\ETF_分钟数据`，就把环境变量设置为后者。需要先用
+`Test-Path` 确认目录层级。
+
+这个目录只提供 ETF 标的端的 1 分钟数据。它不包含项目内的期权分钟归档、
+期权日级候选表、IV/Greeks 表或外部 ETF 5 分钟 SQLite。
+
 ## 四、凭证和本地配置
 
 | 路径 | 说明 |

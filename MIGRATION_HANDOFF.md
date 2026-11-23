@@ -116,6 +116,16 @@ export OPTION_ETF_SQLITE_PATH="/absolute/path/to/etf_5m_2020_202605.sqlite"
 export OPTION_ETF_1M_ROOT="/absolute/path/to/1-minute-etf-archive"
 ```
 
+Windows PowerShell 示例：
+
+```powershell
+$env:OPTION_ETF_1M_ROOT = 'D:\A股数据\基金_分钟数据\ETF_分钟数据\1分钟_按月归档'
+```
+
+如果该目录不存在，先检查
+`D:\A股数据\基金_分钟数据\ETF_分钟数据` 是否直接包含月份目录，再把环境变量
+设置到实际包含 ETF 1 分钟文件的那一层。
+
 如需使用 iFinD：
 
 ```bash
