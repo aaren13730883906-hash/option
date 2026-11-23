@@ -90,8 +90,8 @@ $env:OPTION_ETF_1M_ROOT = 'D:\A股数据\基金_分钟数据\ETF_分钟数据\1�
 
 | 路径 | 说明 |
 |---|---|
-| `data:ifind_refresh_token/refresh- token.rtf` | iFinD refresh token |
-| `data:ifind_refresh_token/VIP.rtf` | iFinD VIP 凭证 |
+| `data_ifind_refresh_token/refresh- token.rtf` | iFinD refresh token |
+| `data_ifind_refresh_token/VIP.rtf` | iFinD VIP 凭证 |
 | `qmt/qmt_local_config.py` | QMT 本地账户和下单开关 |
 
 这三项不能进入 Git。迁移时必须单独安全复制，并在新电脑重新验证。

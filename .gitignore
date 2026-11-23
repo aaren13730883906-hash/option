@@ -1,9 +1,11 @@
 .DS_Store
 .deps/
+.venv/
+/build/
 
 # Local market data and credentials are intentionally not versioned.
 data/
-data:ifind_refresh_token/
+data_ifind_refresh_token/
 qmt/qmt_local_config.py
 .qmt_runtime/
 qmt/*.txt

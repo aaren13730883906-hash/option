@@ -19,7 +19,7 @@ DATA = ROOT / "data"
 ETF_CACHE = DATA / "etf_intraday_ifind"
 OPTION_CACHE = DATA / "intraday_cache"
 OUTPUT_HTML = ROOT / "research" / "qmt_20260724_588000_10011916_trade_review.html"
-TOKEN_RTF = ROOT / "data:ifind_refresh_token" / "refresh- token.rtf"
+TOKEN_RTF = ROOT / "data_ifind_refresh_token" / "refresh- token.rtf"
 
 GET_ACCESS_TOKEN_URL = "https://quantapi.51ifind.com/api/v1/get_access_token"
 HIGH_FREQUENCY_URL = "https://quantapi.51ifind.com/api/v1/high_frequency"
@@ -59,7 +59,7 @@ def get_access_token() -> str:
     if not refresh_token:
         raise RuntimeError(
             "No iFinD token found. Set IFIND_ACCESS_TOKEN/IFIND_REFRESH_TOKEN "
-            "or provide data:ifind_refresh_token/refresh- token.rtf"
+            "or provide data_ifind_refresh_token/refresh- token.rtf"
         )
     response = requests.post(
         GET_ACCESS_TOKEN_URL,

@@ -91,7 +91,7 @@ git pull --ff-only origin main
 - `data/`
 - `research/`
 - `.deps/`
-- `data:ifind_refresh_token/`
+- `data_ifind_refresh_token/`
 - `qmt/qmt_local_config.py`
 - `.env`
 - QMT 运行日志和个人账户截图

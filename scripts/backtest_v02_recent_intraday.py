@@ -32,7 +32,7 @@ ETF_INTRADAY_IFIND = DATA_DIR / "etf_intraday_ifind"
 DAILY_CSV = DATA_DIR / "kcb_option_daily.csv"
 MARKET_IV_CSV = DATA_DIR / "kcb_market_iv_daily.csv"
 ETF_DAILY_CSV = DATA_DIR / "etf_daily_588000_588080.csv"
-TOKEN_RTF = ROOT / "data:ifind_refresh_token" / "refresh- token.rtf"
+TOKEN_RTF = ROOT / "data_ifind_refresh_token" / "refresh- token.rtf"
 DEFAULT_SQLITE = Path(
     os.environ.get(
         "OPTION_ETF_SQLITE_PATH",
@@ -404,7 +404,7 @@ def get_access_token() -> str:
 
     refresh_token = os.environ.get("IFIND_REFRESH_TOKEN") or parse_rtf_secret(TOKEN_RTF)
     if not refresh_token:
-        raise RuntimeError("No iFinD token found in env or data:ifind_refresh_token/refresh- token.rtf")
+        raise RuntimeError("No iFinD token found in env or data_ifind_refresh_token/refresh- token.rtf")
 
     response = requests.post(
         GET_ACCESS_TOKEN_URL,

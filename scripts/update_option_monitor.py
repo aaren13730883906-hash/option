@@ -12,7 +12,7 @@ Usage:
 Token lookup:
   - IFIND_ACCESS_TOKEN
   - IFIND_REFRESH_TOKEN
-  - data:ifind_refresh_token/refresh- token.rtf
+  - data_ifind_refresh_token/refresh- token.rtf
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / "monitor" / "state.json"
 MANUAL_QUOTES_PATH = ROOT / "monitor" / "manual_quotes.json"
 CACHE_DIR = ROOT / "monitor" / "ifind_cache"
-TOKEN_RTF = ROOT / "data:ifind_refresh_token" / "refresh- token.rtf"
+TOKEN_RTF = ROOT / "data_ifind_refresh_token" / "refresh- token.rtf"
 
 GET_ACCESS_TOKEN_URL = "https://quantapi.51ifind.com/api/v1/get_access_token"
 HIGH_FREQUENCY_URL = "https://quantapi.51ifind.com/api/v1/high_frequency"
