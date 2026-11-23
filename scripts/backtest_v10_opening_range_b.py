@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -26,7 +27,12 @@ import backtest_v02_recent_intraday as bt  # noqa: E402
 
 
 RESEARCH_DIR = ROOT / "research"
-ETF_1M_ROOT = Path("/Users/aaren/策略/A股数据/基金_分钟数据/ETF_分钟数据/1分钟_按月归档")
+ETF_1M_ROOT = Path(
+    os.environ.get(
+        "OPTION_ETF_1M_ROOT",
+        "/Users/aaren/策略/A股数据/基金_分钟数据/ETF_分钟数据/1分钟_按月归档",
+    )
+)
 
 
 def parse_args() -> argparse.Namespace:

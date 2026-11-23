@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -26,7 +27,10 @@ RISK_DIR = CACHE_DIR / "risk_indicator_sse"
 OPTION_DAILY_DIR = CACHE_DIR / "option_daily_sina"
 
 DEFAULT_SQLITE = Path(
-    "/Users/aaren/ChinaETF/china-etf-strategy/cache/etf_5m_2020_202605.sqlite"
+    os.environ.get(
+        "OPTION_ETF_SQLITE_PATH",
+        "/Users/aaren/ChinaETF/china-etf-strategy/cache/etf_5m_2020_202605.sqlite",
+    )
 )
 UNDERLYINGS = {
     "588000": "科创50ETF",

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import html
 import math
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -13,11 +14,16 @@ from pathlib import Path
 import pandas as pd
 
 
-ROOT = Path("/Users/aaren/策略/期权策略")
+ROOT = Path(__file__).resolve().parents[1]
 RESEARCH = ROOT / "research"
 DATA = ROOT / "data"
 INTRADAY = DATA / "intraday_cache"
-SQLITE = Path("/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite")
+SQLITE = Path(
+    os.environ.get(
+        "OPTION_ETF_SQLITE_PATH",
+        "/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite",
+    )
+)
 TRADES = RESEARCH / "backtest_v05_588000_recent1m_trades.csv"
 CAPITAL = RESEARCH / "backtest_v05_588000_capital_100k.csv"
 MARKET_IV = DATA / "kcb_market_iv_daily.csv"

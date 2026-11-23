@@ -13,10 +13,19 @@ Keep TEST_ORDER_ARMED False until you intentionally test one contract.
 
 from __future__ import print_function
 
+try:
+    from qmt_local_config import (
+        PASSORDER_PROBE_ARMED,
+        QMT_ACCOUNT_ID as LOCAL_QMT_ACCOUNT_ID,
+    )
+except Exception:
+    PASSORDER_PROBE_ARMED = False
+    LOCAL_QMT_ACCOUNT_ID = ""
 
-BUILD_ID = "QMT_PASSORDER_VARIANT_PROBE_20260804_R1"
 
-ACCOUNT_ID = "210400032829"
+BUILD_ID = "QMT_PASSORDER_VARIANT_PROBE_20260804_R2_ARMED_VARIANT1"
+
+ACCOUNT_ID = LOCAL_QMT_ACCOUNT_ID
 ACCOUNT_TYPE_INT = 1101
 ACCOUNT_TYPE_TEXT = "STOCK_OPTION"
 STRATEGY_NAME = "kcb_1032_live_sim"
@@ -25,8 +34,12 @@ TARGET_CODE = "10012156.SHO"
 TARGET_PRICE = 0.1125
 TARGET_QTY = 1
 
-TEST_ORDER_ARMED = False
-VARIANT_INDEX = 0
+# WARNING: True means this probe will send ONE real/sim buy-open test order.
+TEST_ORDER_ARMED = PASSORDER_PROBE_ARMED
+
+# 1 = root code + price_type 11 + quickTrade + ContextInfo.
+# This tests whether removing the .SHO suffix fixes the QMT rejection.
+VARIANT_INDEX = 1
 
 BUY_OPEN_OP = 50
 QUICK_TRADE = 1

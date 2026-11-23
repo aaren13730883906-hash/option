@@ -4,11 +4,22 @@
 # Local market data and credentials are intentionally not versioned.
 data/
 data:ifind_refresh_token/
+qmt/qmt_local_config.py
+.qmt_runtime/
+qmt/*.txt
+qmt/*.numbers
+.env
+.env.*
 
 # Research outputs can be regenerated from scripts and local data.
 research/
 
 # Runtime/cache artifacts.
+monitor/state.json
+monitor/manual_quotes.json
+monitor/ifind_cache/
+monitor/*.html
+monitor/*.json
 __pycache__/
 *.pyc
 .ipynb_checkpoints/

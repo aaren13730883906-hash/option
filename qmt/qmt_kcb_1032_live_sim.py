@@ -22,12 +22,21 @@ from __future__ import print_function
 import datetime
 import math
 
+try:
+    from qmt_local_config import (
+        QMT_ACCOUNT_ID as LOCAL_QMT_ACCOUNT_ID,
+        QMT_NATIVE_ORDER_ENABLED as LOCAL_QMT_NATIVE_ORDER_ENABLED,
+    )
+except Exception:
+    LOCAL_QMT_ACCOUNT_ID = ""
+    LOCAL_QMT_NATIVE_ORDER_ENABLED = False
+
 
 # ---------------------------------------------------------------------------
 # User configuration
 # ---------------------------------------------------------------------------
 
-BUILD_ID = "KCB_1606_LIVE_SIM_20260804_R12_ASCII_REJECT_CHECK"
+BUILD_ID = "KCB_1606_LIVE_SIM_20260818_R20_OWNED_POSITION_REGISTRY"
 KCB_CODE = "588000.SH"
 UNDERLYINGS = [KCB_CODE]
 
@@ -36,8 +45,8 @@ ABS_PREMIUM_CAP = 150000.0
 FEE_PER_CONTRACT_PER_SIDE = 2.0
 CONTRACT_MULTIPLIER_DEFAULT = 10000
 
-QMT_NATIVE_ORDER_ENABLED = True
-QMT_ACCOUNT_ID = "210400032829"
+QMT_NATIVE_ORDER_ENABLED = LOCAL_QMT_NATIVE_ORDER_ENABLED
+QMT_ACCOUNT_ID = LOCAL_QMT_ACCOUNT_ID
 QMT_OPTION_ACCOUNT_TYPE = 1101
 QMT_BUY_OPEN_OP = 50
 QMT_SELL_CLOSE_OP = 51
@@ -64,11 +73,23 @@ QMT_LIQUIDITY_ADD_MIN_PRICE_FACTOR = 0.98
 QMT_LIQUIDITY_ADD_REQUIRE_SIGNAL_ALIVE = True
 QMT_LOG_TRADE_DETAIL_AFTER_ORDER = True
 QMT_LOG_LAST_ORDER_BY_ID_AFTER_ORDER = True
+QMT_REQUIRE_ORDER_CONFIRMATION_FOR_SHADOW = True
+QMT_BLOCK_REOPEN_IF_NATIVE_TODAY_ACTIVITY = True
+QMT_ADOPT_NATIVE_POSITION_ON_RESTART = False
+QMT_AUTO_RECOVER_ONLY_REGISTERED_CODES = True
+QMT_OWNED_POSITION_REGISTRY_FILE = "kcb_1606_owned_positions.csv"
+QMT_OWNED_POSITION_CODE_OVERRIDES = []
+QMT_VERIFY_ORDER_SIDE = True
+QMT_REQUIRE_NATIVE_POSITION_FOR_SELL = True
+QMT_INFER_CLOSE_WHEN_NATIVE_POSITION_MISSING_AFTER_SELL = True
+QMT_PENDING_OPEN_MAX_BARS = 3
 QMT_VERBOSE_SIGNAL_LOG = False
 
 LIVE_MAX_TRADES_PER_DAY = 1
 LIVE_MAX_CONTRACTS = 0
 LIVE_REQUIRE_LAST_BAR_FOR_ORDER = False
+LIVE_ORDER_REQUIRE_WALL_CLOCK_SYNC = True
+LIVE_ORDER_MAX_BAR_LAG_SECONDS = 300
 LIVE_WALL_CLOCK_GATE = True
 LIVE_TRADE_DATE_OVERRIDE = 0
 
@@ -231,6 +252,10 @@ RUNTIME_ORDER_KEYS = set()
 RUNTIME_MINUTE_ORDER_KEYS = set()
 RUNTIME_OPEN_LOCK_DATES = set()
 RUNTIME_SIGNAL_LOG_KEYS = set()
+RUNTIME_NATIVE_PATH_BY_CODE = {}
+RUNTIME_NATIVE_DIRECTION_BY_CODE = {}
+RUNTIME_OWNED_REGISTRY_KEYS = set()
+RUNTIME_LAST_BAR_TEXT = ""
 
 
 def log(*items):
@@ -397,6 +422,34 @@ def wall_clock_date():
         return 0
 
 
+def wall_clock_text():
+    try:
+        return datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    except Exception:
+        return ""
+
+
+def datetime_from_text(value):
+    try:
+        return datetime.datetime.strptime(str(value), "%Y%m%d%H%M%S")
+    except Exception:
+        return None
+
+
+def live_order_time_allows(now_text):
+    if not LIVE_ORDER_REQUIRE_WALL_CLOCK_SYNC:
+        return True, "disabled"
+    bar_dt = datetime_from_text(now_text)
+    wall_text = wall_clock_text()
+    wall_dt = datetime_from_text(wall_text)
+    if bar_dt is None or wall_dt is None:
+        return False, "bad_time"
+    lag_seconds = abs((wall_dt - bar_dt).total_seconds())
+    if lag_seconds <= LIVE_ORDER_MAX_BAR_LAG_SECONDS:
+        return True, "live_sync"
+    return False, "bar_wall_lag_%d_wall_%s" % (int(lag_seconds), wall_text)
+
+
 def live_trade_date():
     override = safe_int(LIVE_TRADE_DATE_OVERRIDE)
     if override > 0:
@@ -438,10 +491,20 @@ def read_native_account_snapshot():
 
 
 def read_native_trade_detail(kind):
-    attempts = [
-        (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), kind),
-        (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), kind, QMT_STRATEGY_NAME),
-    ]
+    kind_values = []
+    for item in [kind, str(kind).upper(), str(kind).lower()]:
+        if item not in kind_values:
+            kind_values.append(item)
+    attempts = []
+    for kind_value in kind_values:
+        attempts.extend([
+            (QMT_ACCOUNT_ID, QMT_QUERY_ACCOUNT_TYPE_TEXT, kind_value),
+            (QMT_ACCOUNT_ID, QMT_QUERY_ACCOUNT_TYPE_TEXT, kind_value, QMT_STRATEGY_NAME),
+            (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), kind_value),
+            (QMT_ACCOUNT_ID, str(QMT_OPTION_ACCOUNT_TYPE), kind_value, QMT_STRATEGY_NAME),
+            (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, kind_value),
+            (QMT_ACCOUNT_ID, QMT_OPTION_ACCOUNT_TYPE, kind_value, QMT_STRATEGY_NAME),
+        ])
     last_error = None
     for args in attempts:
         try:
@@ -484,9 +547,23 @@ def log_order_object_fields(label, datatype, obj):
         "m_nVolumeTotalOriginal",
         "m_nVolumeTraded",
         "m_nVolumeTotal",
+        "m_nVolume",
+        "m_nTradeVolume",
+        "m_nBusinessAmount",
+        "m_nEntrustAmount",
+        "m_nOrderAmount",
+        "m_nCanUseVolume",
+        "m_nEnableAmount",
+        "m_nCurrentAmount",
         "m_dLimitPrice",
         "m_dTradePrice",
         "m_dTradeAmount",
+        "m_dOpenPrice",
+        "m_dCostPrice",
+        "m_dPositionCost",
+        "m_dAvgPrice",
+        "m_dLastPrice",
+        "m_dMarketPrice",
         "m_strInsertDate",
         "m_strInsertTime",
         "m_strTradeDate",
@@ -539,6 +616,242 @@ def code_matches_order_object(obj, expected_code):
     return instrument == expected or instrument == expected_root
 
 
+def obj_field(obj, field_name, default=None):
+    try:
+        return getattr(obj, field_name)
+    except Exception:
+        return default
+
+
+def obj_instrument(obj):
+    return str(obj_field(obj, "m_strInstrumentID", ""))
+
+
+def obj_date(obj):
+    value = obj_field(obj, "m_strInsertDate", None)
+    if value is None or str(value).strip() in ["", "0", "None"]:
+        value = obj_field(obj, "m_strTradeDate", None)
+    return safe_int(value, 0)
+
+
+def obj_time(obj):
+    value = obj_field(obj, "m_strInsertTime", None)
+    if value is None or str(value).strip() in ["", "0", "None"]:
+        value = obj_field(obj, "m_strTradeTime", None)
+    return str(value)
+
+
+def first_obj_int(obj, field_names):
+    for field_name in field_names:
+        value = obj_field(obj, field_name, None)
+        number = safe_int(value, 0)
+        if number > 0:
+            return number
+    return 0
+
+
+def first_obj_float(obj, field_names):
+    for field_name in field_names:
+        value = obj_field(obj, field_name, None)
+        number = safe_float(value)
+        if number is not None and number > 0:
+            return number
+    return None
+
+
+def obj_original_qty(obj):
+    return first_obj_int(obj, [
+        "m_nVolumeTotalOriginal",
+        "m_nEntrustAmount",
+        "m_nOrderAmount",
+        "m_nVolume",
+        "m_nVolumeTotal",
+        "m_nVolumeTraded",
+    ])
+
+
+def obj_traded_qty(obj):
+    return first_obj_int(obj, [
+        "m_nVolumeTraded",
+        "m_nTradeVolume",
+        "m_nBusinessAmount",
+        "m_nTradeAmount",
+        "m_nVolume",
+        "m_nMatchedAmount",
+        "m_nFilledVolume",
+        "m_nVolumeTotalOriginal",
+    ])
+
+
+def obj_position_qty(obj):
+    return first_obj_int(obj, [
+        "m_nVolume",
+        "m_nCurrentAmount",
+        "m_nCanUseVolume",
+        "m_nEnableAmount",
+        "m_nPosition",
+        "m_nPositionVolume",
+        "m_nVolumeTotalOriginal",
+        "m_nVolumeTotal",
+    ])
+
+
+def obj_avg_price(obj):
+    return first_obj_float(obj, [
+        "m_dOpenPrice",
+        "m_dCostPrice",
+        "m_dPositionCost",
+        "m_dAvgPrice",
+        "m_dLastPrice",
+        "m_dMarketPrice",
+        "m_dPrice",
+    ])
+
+
+def obj_direction_value(obj):
+    for field_name in ["m_nDirection", "m_strDirection", "m_chDirection"]:
+        value = obj_field(obj, field_name, None)
+        if value is not None and str(value).strip() not in ["", "None"]:
+            return str(value).strip()
+    return ""
+
+
+def obj_offset_value(obj):
+    for field_name in ["m_nOffsetFlag", "m_strOffsetFlag", "m_chOffsetFlag"]:
+        value = obj_field(obj, field_name, None)
+        if value is not None and str(value).strip() not in ["", "None"]:
+            return str(value).strip()
+    return ""
+
+
+def order_side_matches(obj, expected_side):
+    if not QMT_VERIFY_ORDER_SIDE or expected_side is None:
+        return True, "side_not_checked"
+    direction = obj_direction_value(obj)
+    offset = obj_offset_value(obj)
+    if direction == "" and offset == "":
+        return False, "side_missing"
+    if expected_side == "buy":
+        if direction in ["48", "0", "buy", "BUY"] and offset in ["48", "0", "open", "OPEN"]:
+            return True, "buy_open"
+        return False, "side"
+    if expected_side == "sell":
+        if direction in ["49", "1", "sell", "SELL"] and offset in ["49", "1", "close", "CLOSE"]:
+            return True, "sell_close"
+        return False, "side"
+    return True, "unknown_expected_side"
+
+
+def order_confirm_matches(obj, expected_code, expected_date, expected_qty, datatype, expected_side=None):
+    if obj is None:
+        return False, "empty"
+    if not code_matches_order_object(obj, expected_code):
+        return False, "code"
+    side_ok, side_reason = order_side_matches(obj, expected_side)
+    if not side_ok:
+        return False, side_reason
+    got_date = obj_date(obj)
+    if expected_date and got_date and got_date != expected_date:
+        return False, "date"
+    qty = obj_original_qty(obj) if datatype == "ORDER" else obj_traded_qty(obj)
+    if expected_qty and qty <= 0:
+        return False, "qty_missing"
+    if expected_qty and qty and datatype == "ORDER" and qty != int(expected_qty):
+        return False, "qty"
+    if expected_qty and qty and datatype == "DEAL" and qty > int(expected_qty):
+        return False, "qty"
+    return True, "match"
+
+
+def flatten_trade_objects(data):
+    if data is None:
+        return []
+    if isinstance(data, (list, tuple)):
+        output = []
+        for item in data:
+            output.extend(flatten_trade_objects(item))
+        return output
+    if isinstance(data, dict):
+        output = []
+        for item in data.values():
+            output.extend(flatten_trade_objects(item))
+        return output
+    if isinstance(data, (str, int, float)):
+        return []
+    return [data]
+
+
+def scan_trade_detail_for_match(label, kind, expected_code, expected_date, expected_qty, expected_side=None):
+    ok, data = read_native_trade_detail(kind)
+    if not ok:
+        log("ORDER_CONFIRM_SCAN_ERROR", label, "kind=", kind, "error=", short_repr(data, 240))
+        return False, None
+    objects = flatten_trade_objects(data)
+    match_count = 0
+    total_qty = 0
+    sample = None
+    datatype = "ORDER" if kind == "order" else "DEAL"
+    for obj in objects:
+        matched, reason = order_confirm_matches(obj, expected_code, expected_date, expected_qty, datatype, expected_side)
+        if not matched:
+            continue
+        match_count += 1
+        if datatype == "ORDER":
+            total_qty += obj_original_qty(obj)
+        else:
+            total_qty += obj_traded_qty(obj)
+        if sample is None:
+            sample = obj
+    if match_count > 0:
+        if expected_qty and total_qty <= 0:
+            log(
+                "ORDER_CONFIRM_SCAN_AMBIGUOUS_ZERO_QTY",
+                label,
+                "kind=", kind,
+                "code=", expected_code,
+                "date=", expected_date,
+                "matches=", match_count,
+                "qty_sum=", total_qty,
+                "note=", "not_enough_to_confirm_current_order",
+            )
+            return False, sample
+        if expected_qty and datatype == "DEAL" and total_qty < int(expected_qty):
+            log(
+                "ORDER_CONFIRM_SCAN_QTY_SHORT",
+                label,
+                "kind=", kind,
+                "code=", expected_code,
+                "date=", expected_date,
+                "expected_qty=", expected_qty,
+                "qty_sum=", total_qty,
+                "side=", expected_side,
+                "note=", "partial_or_stale_deal_not_used_for_full_shadow_fill",
+            )
+            return False, sample
+        log(
+            "ORDER_CONFIRM_SCAN_MATCH",
+            label,
+            "kind=", kind,
+            "code=", expected_code,
+            "date=", expected_date,
+            "side=", expected_side,
+            "matches=", match_count,
+            "qty_sum=", total_qty,
+            "sample=", short_repr(sample, 220),
+        )
+        return True, sample
+    log(
+        "ORDER_CONFIRM_SCAN_NO_MATCH",
+        label,
+        "kind=", kind,
+        "code=", expected_code,
+        "date=", expected_date,
+        "side=", expected_side,
+        "objects=", len(objects),
+    )
+    return False, None
+
+
 def order_object_reject_reason(obj):
     if obj is None:
         return None
@@ -579,7 +892,7 @@ def order_object_reject_reason(obj):
     return None
 
 
-def verify_last_order_not_rejected(ContextInfo, label, expected_code):
+def verify_last_order_not_rejected(ContextInfo, label, expected_code, expected_qty=None, expected_date=None, expected_side=None):
     account_id = getattr(ContextInfo, "live_account_id", QMT_ACCOUNT_ID)
     order_ids = []
     for use_strategy in [False, True]:
@@ -593,25 +906,530 @@ def verify_last_order_not_rejected(ContextInfo, label, expected_code):
         except Exception as exc:
             log("ORDER_VERIFY_ID_ERROR", label, "strategy=", use_strategy, "error=", repr(exc))
     if not order_ids:
-        log("ORDER_VERIFY_NO_LAST_ORDER", label, "code=", expected_code, "note=", "cannot_confirm_reject")
-        return True
+        log("ORDER_VERIFY_NO_LAST_ORDER", label, "code=", expected_code, "note=", "will_scan_trade_detail")
     for order_id in order_ids:
         try:
             obj = get_value_by_order_id(order_id, account_id, QMT_QUERY_ACCOUNT_TYPE_TEXT, "ORDER")
         except Exception as exc:
             log("ORDER_VERIFY_OBJECT_ERROR", label, "id=", order_id, "error=", repr(exc))
             continue
-        if not code_matches_order_object(obj, expected_code):
-            log("ORDER_VERIFY_SKIP_OTHER_CODE", label, "id=", order_id, "expected=", expected_code, "obj=", short_repr(obj, 180))
+        matched, mismatch_reason = order_confirm_matches(obj, expected_code, expected_date, expected_qty, "ORDER", expected_side)
+        if not matched:
+            log(
+                "ORDER_CONFIRM_MISMATCH",
+                label,
+                "id=", order_id,
+                "reason=", mismatch_reason,
+                "expected_code=", expected_code,
+                "expected_date=", expected_date,
+                "expected_qty=", expected_qty,
+                "expected_side=", expected_side,
+                "got_code=", obj_instrument(obj),
+                "got_date=", obj_date(obj),
+                "got_time=", obj_time(obj),
+                "got_original=", obj_original_qty(obj),
+                "got_traded=", obj_traded_qty(obj),
+                "got_direction=", obj_direction_value(obj),
+                "got_offset=", obj_offset_value(obj),
+                "note=", "ignore_other_or_stale_order",
+            )
             continue
         reason = order_object_reject_reason(obj)
         if reason:
             log("ORDER_REJECTED_CONFIRMED", label, "id=", order_id, "code=", expected_code, "reason=", short_repr(reason, 300))
             return False
-        log("ORDER_ACCEPT_NOT_REJECTED", label, "id=", order_id, "code=", expected_code, "note=", "no_reject_reason_seen")
+        log("ORDER_ACCEPT_MATCHED", label, "id=", order_id, "code=", expected_code, "qty=", expected_qty, "note=", "no_reject_reason_seen")
         return True
-    log("ORDER_VERIFY_NO_MATCHING_ORDER", label, "code=", expected_code, "ids=", repr(order_ids), "note=", "cannot_confirm_reject")
+
+    order_match, unused_obj = scan_trade_detail_for_match(label, "order", expected_code, expected_date, expected_qty, expected_side)
+    if order_match:
+        return True
+    deal_match, unused_obj = scan_trade_detail_for_match(label, "deal", expected_code, expected_date, expected_qty, expected_side)
+    if deal_match:
+        return True
+
+    log(
+        "ORDER_CONFIRM_UNVERIFIED",
+        label,
+        "code=", expected_code,
+        "date=", expected_date,
+        "qty=", expected_qty,
+        "side=", expected_side,
+        "ids=", repr(order_ids),
+        "strict=", QMT_REQUIRE_ORDER_CONFIRMATION_FOR_SHADOW,
+        "note=", "passorder_returned_but_qmt_query_did_not_find_matching_current_order",
+    )
+    if QMT_REQUIRE_ORDER_CONFIRMATION_FOR_SHADOW:
+        return None
     return True
+
+
+def native_position_snapshot(code):
+    ok, data = read_native_trade_detail("position")
+    if not ok:
+        log("NATIVE_POSITION_READ_ERROR", code, short_repr(data, 240))
+        return None
+    objects = flatten_trade_objects(data)
+    for obj in objects:
+        if not code_matches_order_object(obj, code):
+            continue
+        qty = obj_position_qty(obj)
+        if qty <= 0:
+            continue
+        avg = obj_avg_price(obj)
+        log(
+            "NATIVE_POSITION_FOUND",
+            "code=", code,
+            "qty=", qty,
+            "avg=", avg,
+            "date=", obj_date(obj),
+            "time=", obj_time(obj),
+            "sample=", short_repr(obj, 220),
+        )
+        return {"qty": qty, "avg": avg, "object": obj}
+    log("NATIVE_POSITION_NO_MATCH", "code=", code, "objects=", len(objects))
+    return None
+
+
+def native_position_objects():
+    ok, data = read_native_trade_detail("position")
+    if not ok:
+        log("NATIVE_POSITIONS_READ_ERROR", short_repr(data, 240))
+        return []
+    output = []
+    for obj in flatten_trade_objects(data):
+        code = obj_instrument(obj)
+        qty = obj_position_qty(obj)
+        if not code or qty <= 0:
+            continue
+        avg = obj_avg_price(obj)
+        output.append({"code": code, "qty": qty, "avg": avg, "object": obj})
+    return output
+
+
+def normalize_position_code(code):
+    text = str(code)
+    if "." in text:
+        return text
+    # QMT position/deal objects usually expose option instrument id without
+    # suffix. The KCB contracts used by this strategy are SH options.
+    return text + ".SHO"
+
+
+def owned_registry_path():
+    name = str(QMT_OWNED_POSITION_REGISTRY_FILE or "")
+    if not name:
+        return None
+    return name
+
+
+def append_owned_registry(action, trade_date, code, path, direction, qty, avg, now_text, source):
+    global RUNTIME_OWNED_REGISTRY_KEYS
+    file_path = owned_registry_path()
+    if file_path is None:
+        return
+    full_code = normalize_position_code(code)
+    key = "%s|%s|%s|%s|%s" % (str(action), str(trade_date), full_code, str(now_text), str(source))
+    if key in RUNTIME_OWNED_REGISTRY_KEYS:
+        return
+    RUNTIME_OWNED_REGISTRY_KEYS.add(key)
+    try:
+        line = "%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % (
+            str(action),
+            str(trade_date),
+            full_code,
+            str(path),
+            str(direction),
+            str(safe_int(qty, 0)),
+            str(round(safe_float(avg, 0.0) or 0.0, 8)),
+            str(now_text),
+            str(source),
+        )
+        try:
+            exists = False
+            f = open(file_path, "r")
+            f.close()
+            exists = True
+        except Exception:
+            exists = False
+        f = open(file_path, "a")
+        if not exists:
+            f.write("action,date,code,path,direction,qty,avg,time,source\n")
+        f.write(line)
+        f.close()
+        log("OWNED_REGISTRY_WRITE", action, "date=", trade_date, "code=", full_code, "path=", path, "qty=", safe_int(qty, 0), "file=", file_path)
+    except Exception as exc:
+        log("OWNED_REGISTRY_WRITE_ERROR", action, "code=", full_code, "file=", file_path, "error=", repr(exc))
+
+
+def register_owned_position(code, path, direction, trade_date, qty, avg, now_text, source, persist):
+    global RUNTIME_NATIVE_PATH_BY_CODE, RUNTIME_NATIVE_DIRECTION_BY_CODE
+    full_code = normalize_position_code(code)
+    RUNTIME_NATIVE_PATH_BY_CODE[full_code] = path
+    RUNTIME_NATIVE_DIRECTION_BY_CODE[full_code] = direction
+    if persist:
+        append_owned_registry("OPEN", trade_date, full_code, path, direction, qty, avg, now_text, source)
+    log("OWNED_POSITION_REGISTERED", "code=", full_code, "path=", path, "direction=", direction, "persist=", persist, "source=", source)
+
+
+def unregister_owned_position(code, trade_date, qty, avg, now_text, source):
+    global RUNTIME_NATIVE_PATH_BY_CODE, RUNTIME_NATIVE_DIRECTION_BY_CODE
+    full_code = normalize_position_code(code)
+    path = RUNTIME_NATIVE_PATH_BY_CODE.get(full_code, "")
+    direction = RUNTIME_NATIVE_DIRECTION_BY_CODE.get(full_code, "")
+    if full_code in RUNTIME_NATIVE_PATH_BY_CODE:
+        del RUNTIME_NATIVE_PATH_BY_CODE[full_code]
+    if full_code in RUNTIME_NATIVE_DIRECTION_BY_CODE:
+        del RUNTIME_NATIVE_DIRECTION_BY_CODE[full_code]
+    append_owned_registry("CLOSE", trade_date, full_code, path, direction, qty, avg, now_text, source)
+    log("OWNED_POSITION_UNREGISTERED", "code=", full_code, "date=", trade_date, "source=", source)
+
+
+def load_owned_position_registry(trade_date):
+    global RUNTIME_NATIVE_PATH_BY_CODE, RUNTIME_NATIVE_DIRECTION_BY_CODE
+    loaded = {}
+    file_path = owned_registry_path()
+    if file_path:
+        try:
+            f = open(file_path, "r")
+            for raw in f.readlines():
+                line = raw.strip()
+                if not line or line.startswith("action,"):
+                    continue
+                parts = line.split(",")
+                if len(parts) < 9:
+                    continue
+                action = parts[0]
+                row_date = safe_int(parts[1], 0)
+                code = normalize_position_code(parts[2])
+                path = parts[3]
+                direction = parts[4]
+                if row_date != safe_int(trade_date, 0):
+                    continue
+                if action == "OPEN":
+                    loaded[code] = (path, direction)
+                elif action == "CLOSE" and code in loaded:
+                    del loaded[code]
+            f.close()
+        except Exception as exc:
+            log("OWNED_REGISTRY_READ_ERROR", "date=", trade_date, "file=", file_path, "error=", repr(exc))
+    for item in QMT_OWNED_POSITION_CODE_OVERRIDES:
+        try:
+            if isinstance(item, (list, tuple)):
+                code = normalize_position_code(item[0])
+                path = item[1] if len(item) > 1 else "put_reversal_0945"
+                direction = item[2] if len(item) > 2 else "put"
+            else:
+                code = normalize_position_code(item)
+                path = "put_reversal_0945"
+                direction = "put"
+            loaded[code] = (path, direction)
+        except Exception:
+            pass
+    for code, context in loaded.items():
+        RUNTIME_NATIVE_PATH_BY_CODE[code] = context[0]
+        RUNTIME_NATIVE_DIRECTION_BY_CODE[code] = context[1]
+    if loaded:
+        log("OWNED_REGISTRY_LOADED", "date=", trade_date, "codes=", repr(sorted(loaded.keys())))
+    return loaded
+
+
+def infer_native_position_context(ContextInfo, code, current_date, now_text, time_text):
+    full_code = normalize_position_code(code)
+    path = RUNTIME_NATIVE_PATH_BY_CODE.get(full_code, "native_position_sync")
+    direction = RUNTIME_NATIVE_DIRECTION_BY_CODE.get(full_code, "put")
+    selected = None
+    for item in ContextInfo.state.get("universe", []):
+        if code_matches_order_object(type("Obj", (), {"m_strInstrumentID": str(item.get("code", "")).split(".")[0]})(), full_code):
+            selected = dict(item)
+            break
+    if selected is None:
+        option_type = "PUT"
+        try:
+            detail = ContextInfo.get_option_detail_data(full_code)
+            if isinstance(detail, dict):
+                option_type = option_type_norm(detail.get("optType", option_type))
+                strike = safe_float(detail.get("OptExercisePrice"), 0.0)
+                expire_date = safe_int(detail.get("ExpireDate", 0))
+                rate = safe_float(detail.get("OptUndlRiskFreeRate"), 0.02)
+                multiplier = safe_int(detail.get("OptUnit", detail.get("VolumeMultiple", CONTRACT_MULTIPLIER_DEFAULT)), CONTRACT_MULTIPLIER_DEFAULT)
+                dte = days_to_expiry(current_date, expire_date)
+            else:
+                strike = 0.0
+                expire_date = 0
+                rate = 0.02
+                multiplier = CONTRACT_MULTIPLIER_DEFAULT
+                dte = 0
+        except Exception:
+            strike = 0.0
+            expire_date = 0
+            rate = 0.02
+            multiplier = CONTRACT_MULTIPLIER_DEFAULT
+            dte = 0
+        selected = {
+            "code": full_code,
+            "type": option_type if option_type in ["CALL", "PUT"] else "PUT",
+            "strike": strike,
+            "expire": expire_date,
+            "dte": dte if dte is not None else 0,
+            "rate": rate,
+            "multiplier": multiplier,
+            "iv": 0.0,
+            "delta": 0.0,
+        }
+    if selected.get("type") == "CALL":
+        direction = "call"
+    else:
+        direction = "put"
+    if path == "native_position_sync":
+        # If a position appears during the 09:45 put-reversal window, manage it
+        # with the put-reversal exit rules. Otherwise use fallback-style exits
+        # rather than leaving it unmanaged.
+        if direction == "put" and time_text <= "1000":
+            path = "put_reversal_0945"
+        else:
+            path = "fallback_strong15m"
+    return selected, direction, path
+
+
+def recover_native_position_if_any(ContextInfo, now_text, current_date, time_text):
+    if ContextInfo.position is not None:
+        return False
+    if getattr(ContextInfo, "pending_open", None) is not None:
+        return False
+    if QMT_AUTO_RECOVER_ONLY_REGISTERED_CODES and not RUNTIME_NATIVE_PATH_BY_CODE:
+        return False
+    positions = native_position_objects()
+    if not positions:
+        return False
+    universe_codes = {}
+    for item in ContextInfo.state.get("universe", []):
+        universe_codes[normalize_position_code(item.get("code"))] = True
+    if universe_codes:
+        positions = [row for row in positions if normalize_position_code(row.get("code")) in universe_codes]
+        if not positions:
+            return False
+    if QMT_AUTO_RECOVER_ONLY_REGISTERED_CODES:
+        positions = [row for row in positions if normalize_position_code(row.get("code")) in RUNTIME_NATIVE_PATH_BY_CODE]
+        if not positions:
+            return False
+    positions.sort(key=lambda row: (0 if normalize_position_code(row.get("code")) in RUNTIME_NATIVE_PATH_BY_CODE else 1, str(row.get("code"))))
+    row = positions[0]
+    full_code = normalize_position_code(row.get("code"))
+    selected, direction, path = infer_native_position_context(ContextInfo, full_code, current_date, now_text, time_text)
+    selected["code"] = full_code
+    avg = safe_float(row.get("avg"))
+    fill_price = avg if avg is not None and avg > 0 else selected.get("price", 0.0)
+    pct = position_pct(path, path in ["fallback_strong15m", "fallback_high_iv_put", "fallback_cluster_put"], selected.get("iv"))
+    target_cost = min(max(ContextInfo.cash, INITIAL_CASH) * pct, ABS_PREMIUM_CAP)
+    if adopt_native_position(ContextInfo, selected, direction, path, path in ["fallback_strong15m", "fallback_high_iv_put", "fallback_cluster_put"], now_text, fill_price, target_cost):
+        log(
+            "NATIVE_POSITION_AUTO_RECOVERED",
+            "time=", now_text,
+            "code=", full_code,
+            "qty=", row.get("qty"),
+            "avg=", avg,
+            "path=", path,
+            "note=", "native_position_authoritative_before_signal_scan",
+        )
+        return True
+    return False
+
+
+def native_today_activity(code, current_date):
+    if not QMT_BLOCK_REOPEN_IF_NATIVE_TODAY_ACTIVITY:
+        return False
+    found = False
+    for kind in ["deal", "position"]:
+        ok, data = read_native_trade_detail(kind)
+        if not ok:
+            log("NATIVE_TODAY_ACTIVITY_READ_ERROR", "kind=", kind, "code=", code, "error=", short_repr(data, 240))
+            continue
+        objects = flatten_trade_objects(data)
+        matches = 0
+        qty_sum = 0
+        sample = None
+        for obj in objects:
+            if not code_matches_order_object(obj, code):
+                continue
+            got_date = obj_date(obj)
+            if kind != "position" and current_date and got_date and got_date != current_date:
+                continue
+            matches += 1
+            if kind == "deal":
+                qty_sum += obj_traded_qty(obj)
+            else:
+                qty_sum += obj_position_qty(obj)
+            if sample is None:
+                sample = obj
+        if matches > 0:
+            found = True
+            log(
+                "NATIVE_TODAY_ACTIVITY",
+                "kind=", kind,
+                "code=", code,
+                "date=", current_date,
+                "matches=", matches,
+                "qty_sum=", qty_sum,
+                "sample=", short_repr(sample, 220),
+            )
+    return found
+
+
+def adopt_native_position(ContextInfo, selected, direction, path, strong, now_text, fill_price, target_cost):
+    global RUNTIME_NATIVE_PATH_BY_CODE, RUNTIME_NATIVE_DIRECTION_BY_CODE, RUNTIME_OPEN_LOCK_DATES
+    snap = native_position_snapshot(selected["code"])
+    if snap is None:
+        return False
+    qty = safe_int(snap.get("qty"), 0)
+    avg = safe_float(snap.get("avg"))
+    if qty <= 0:
+        return False
+    if avg is None or avg <= 0:
+        avg = safe_float(fill_price)
+    if avg is None or avg <= 0:
+        log("NATIVE_POSITION_ADOPT_SKIPPED", selected["code"], "reason=", "missing_avg_price")
+        return False
+    fee = qty * FEE_PER_CONTRACT_PER_SIDE
+    premium = qty * avg * selected["multiplier"]
+    ContextInfo.cash = max(0.0, ContextInfo.cash - premium - fee)
+    ContextInfo.position = {
+        "code": selected["code"],
+        "direction": direction,
+        "path": path,
+        "strong": bool(strong),
+        "quantity": qty,
+        "initial_quantity": qty,
+        "avg_price": avg,
+        "avg_fill_price": avg,
+        "first_price": avg,
+        "multiplier": selected["multiplier"],
+        "target_cost": target_cost,
+        "entry_time": now_text,
+        "entry_minute": safe_int(now_text[8:12]),
+        "opening_confirmed": path != "opening",
+        "partial_done": False,
+        "high_water": avg,
+        "total_buy": premium,
+        "total_sell": 0.0,
+        "total_fees": fee,
+        "entry_etf": ContextInfo.state.get("last_etf_close"),
+        "entry_ma20": ContextInfo.daily_info.get("ma20"),
+        "entry_quote_source": "native_position_sync",
+        "entry_bid1": None,
+        "entry_ask1": None,
+        "entry_bidv1": None,
+        "entry_askv1": None,
+        "liquidity_target_quantity": qty,
+        "liquidity_pending_quantity": 0,
+        "liquidity_add_enabled": False,
+        "last_liquidity_add_bar": "",
+        "put_rev_hold_mode": False,
+        "put_rev_hold_scale_done": False,
+        "put_rev_hold_trailing_stop": None,
+        "opening_put_fail_trailing_stop": None,
+        "opening_put_fail_hold_mode": False,
+    }
+    ContextInfo.day_locked = True
+    ContextInfo.day_entries = max(ContextInfo.day_entries, 1)
+    current_date = safe_int(now_text[:8])
+    if current_date > 0:
+        RUNTIME_OPEN_LOCK_DATES.add(current_date)
+    register_owned_position(selected["code"], path, direction, current_date, qty, avg, now_text, "native_adopt", True)
+    log(
+        "NATIVE_POSITION_ADOPTED",
+        "time=", now_text,
+        "path=", path,
+        "code=", selected["code"],
+        "qty=", qty,
+        "avg=", round(avg, 6),
+        "cash=", round(ContextInfo.cash, 2),
+        "note=", "restart_sync_manage_from_next_bar",
+    )
+    return True
+
+
+def clear_pending_open(ContextInfo, reason):
+    pending = getattr(ContextInfo, "pending_open", None)
+    if pending is not None:
+        log(
+            "PENDING_OPEN_CLEARED",
+            "reason=", reason,
+            "code=", pending.get("code"),
+            "path=", pending.get("path"),
+            "submitted=", pending.get("submitted_qty"),
+            "wait_bars=", pending.get("wait_bars"),
+        )
+    ContextInfo.pending_open = None
+    if ContextInfo.position is None:
+        ContextInfo.day_locked = False
+
+
+def set_pending_open(ContextInfo, selected, direction, path, strong, now_text, fill_price, target_cost, submitted_qty, target_qty, execution_price):
+    ContextInfo.pending_open = {
+        "code": selected["code"],
+        "selected": dict(selected),
+        "direction": direction,
+        "path": path,
+        "strong": bool(strong),
+        "entry_time": now_text,
+        "fill_price": fill_price,
+        "target_cost": target_cost,
+        "submitted_qty": submitted_qty,
+        "target_qty": target_qty,
+        "execution_price": execution_price,
+        "wait_bars": 0,
+    }
+    ContextInfo.day_locked = True
+    register_owned_position(selected["code"], path, direction, safe_int(now_text[:8]), submitted_qty, execution_price, now_text, "pending_runtime_only", False)
+    log(
+        "PENDING_OPEN_SET",
+        "time=", now_text,
+        "path=", path,
+        "code=", selected["code"],
+        "submitted=", submitted_qty,
+        "target=", target_qty,
+        "limit=", execution_price,
+        "note=", "wait_native_position_before_shadow",
+    )
+
+
+def reconcile_pending_open(ContextInfo, now_text):
+    pending = getattr(ContextInfo, "pending_open", None)
+    if pending is None or ContextInfo.position is not None:
+        return False
+    selected = pending.get("selected")
+    if not isinstance(selected, dict):
+        clear_pending_open(ContextInfo, "bad_pending_selected")
+        return False
+    snap = native_position_snapshot(pending.get("code"))
+    if snap is not None:
+        adopted = adopt_native_position(
+            ContextInfo,
+            selected,
+            pending.get("direction"),
+            pending.get("path"),
+            pending.get("strong"),
+            pending.get("entry_time", now_text),
+            pending.get("fill_price"),
+            pending.get("target_cost"),
+        )
+        if adopted:
+            ContextInfo.pending_open = None
+            log("PENDING_OPEN_ADOPTED", "time=", now_text, "code=", selected["code"], "note=", "native_position_confirmed")
+            return True
+    pending["wait_bars"] = safe_int(pending.get("wait_bars"), 0) + 1
+    if pending["wait_bars"] >= QMT_PENDING_OPEN_MAX_BARS:
+        clear_pending_open(ContextInfo, "native_position_not_found_timeout")
+        return False
+    log(
+        "PENDING_OPEN_WAIT",
+        "time=", now_text,
+        "code=", pending.get("code"),
+        "wait_bars=", pending.get("wait_bars"),
+        "max_bars=", QMT_PENDING_OPEN_MAX_BARS,
+    )
+    return False
 
 
 def log_live_account_status(ContextInfo, label):
@@ -1028,7 +1846,19 @@ def submit_qmt_order(ContextInfo, side, code, quantity, reference_price, quote=N
                 return False
         except Exception:
             pass
-    now_text, unused_date, unused_time = current_datetime(ContextInfo)
+    now_text, current_date, unused_time = current_datetime(ContextInfo)
+    order_time_ok, order_time_reason = live_order_time_allows(now_text)
+    if not order_time_ok:
+        log(
+            "QMT_ORDER_BLOCKED",
+            "wall_clock_replay_or_lag",
+            side,
+            code,
+            "bar=", now_text,
+            "reason=", order_time_reason,
+            "note=", "native_order_only_on_live_bar",
+        )
+        return False
     key = (now_text, side, str(code), int(quantity))
     minute_key = (now_text, side, str(code))
     if minute_key in RUNTIME_MINUTE_ORDER_KEYS:
@@ -1085,9 +1915,20 @@ def submit_qmt_order(ContextInfo, side, code, quantity, reference_price, quote=N
         log("PASSORDER_RETURN", repr(result))
         log_last_order_by_id(ContextInfo, "after_passorder_%s_%s" % (side, str(code)))
         log_trade_detail_snapshots(ContextInfo, "after_passorder_%s_%s" % (side, str(code)))
-        if not verify_last_order_not_rejected(ContextInfo, "after_passorder_%s_%s" % (side, str(code)), code):
+        confirm_result = verify_last_order_not_rejected(
+            ContextInfo,
+            "after_passorder_%s_%s" % (side, str(code)),
+            code,
+            int(quantity),
+            current_date,
+            side,
+        )
+        if confirm_result is False:
             return False
-        return True
+        if confirm_result is None:
+            log("ORDER_CONFIRM_PENDING", side, code, "qty=", int(quantity), "note=", "will_sync_native_position")
+            return "pending"
+        return "confirmed"
     except Exception as exc:
         log("PASSORDER_ERROR", repr(exc))
         log_last_order_by_id(ContextInfo, "after_passorder_error_%s_%s" % (side, str(code)))
@@ -1532,7 +2373,7 @@ def apply_buy_fill_to_position(ContextInfo, pos, quantity, fill_price, execution
 
 
 def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_price, allocation_factor):
-    global RUNTIME_OPEN_LOCK_DATES
+    global RUNTIME_OPEN_LOCK_DATES, RUNTIME_NATIVE_PATH_BY_CODE, RUNTIME_NATIVE_DIRECTION_BY_CODE
     current_date = safe_int(now_text[:8])
     if current_date in RUNTIME_OPEN_LOCK_DATES:
         log("BUY_BLOCKED", "runtime_daily_open_lock", now_text, path, selected["code"])
@@ -1548,6 +2389,17 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
     target_cost = min(equity * pct, ABS_PREMIUM_CAP)
     if path == "opening_put_fail":
         target_cost = min(target_cost, OPENING_PUT_FAIL_POSITION_CAP)
+    if QMT_ADOPT_NATIVE_POSITION_ON_RESTART:
+        if adopt_native_position(ContextInfo, selected, direction, path, strong, now_text, fill_price, target_cost):
+            return True
+    owned_code = normalize_position_code(selected["code"]) in RUNTIME_NATIVE_PATH_BY_CODE
+    if owned_code and native_today_activity(selected["code"], current_date):
+        ContextInfo.day_locked = True
+        ContextInfo.day_entries = max(ContextInfo.day_entries, 1)
+        if current_date > 0:
+            RUNTIME_OPEN_LOCK_DATES.add(current_date)
+        log("BUY_BLOCKED", "native_today_activity", now_text, path, selected["code"], "note=", "restart_safe_no_duplicate_open")
+        return False
     buy_budget = target_cost * allocation_factor
     quote = build_order_quote(ContextInfo, "buy", selected["code"], fill_price)
     quote["multiplier"] = selected["multiplier"]
@@ -1567,8 +2419,17 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
     fee = quantity * FEE_PER_CONTRACT_PER_SIDE
     if quantity <= 0:
         return False
-    if not submit_qmt_order(ContextInfo, "buy", selected["code"], quantity, fill_price, quote):
+    order_result = submit_qmt_order(ContextInfo, "buy", selected["code"], quantity, fill_price, quote)
+    if not order_result:
+        if adopt_native_position(ContextInfo, selected, direction, path, strong, now_text, fill_price, target_cost):
+            log("BUY_ADOPTED_AFTER_SUBMIT_FAIL", now_text, selected["code"], "note=", "native_position_found")
+            return True
         log("BUY_ABORTED_ORDER_NOT_SENT", now_text, selected["code"])
+        return False
+    if order_result == "pending":
+        set_pending_open(ContextInfo, selected, direction, path, strong, now_text, fill_price, target_cost, quantity, target_quantity, execution_price)
+        if reconcile_pending_open(ContextInfo, now_text):
+            return True
         return False
     ContextInfo.cash -= premium + fee
     ContextInfo.position = {
@@ -1612,6 +2473,7 @@ def paper_open(ContextInfo, selected, direction, path, strong, now_text, fill_pr
     ContextInfo.day_entries += 1
     if current_date > 0:
         RUNTIME_OPEN_LOCK_DATES.add(current_date)
+    register_owned_position(selected["code"], path, direction, current_date, quantity, execution_price, now_text, "buy_open_confirmed", True)
     log("BUY", now_text, path, direction, selected["code"], "qty=", quantity, "planned=", planned_quantity, "pending=", max(0, target_quantity - quantity), "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "pct=", pct, "target_cost=", round(target_cost, 2), "iv=", round(selected.get("iv", 0), 4), "delta=", round(selected.get("delta", 0), 4), "dte=", selected.get("dte"))
     log("ORDER_EXECUTION_SUMMARY", "buy_open", "time=", now_text, "path=", path, "code=", selected["code"], "planned=", planned_quantity, "submitted=", quantity, "pending=", max(0, target_quantity - quantity), "limit=", execution_price, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "expected_amount=", round(premium, 2), "expected_fee=", round(fee, 2), "note=", "compare_with_QMT_deal_panel")
     log("SHADOW_FILL_ASSUMED", "buy", selected["code"], "qty=", quantity)
@@ -1648,7 +2510,12 @@ def paper_add_opening(ContextInfo, now_text, fill_price):
         log("ADD_SKIPPED_LIQUIDITY", now_text, pos["code"], "desired=", desired_quantity, "pending=", pos["liquidity_pending_quantity"])
         pos["opening_confirmed"] = True
         return
-    if not submit_qmt_order(ContextInfo, "buy", pos["code"], quantity, fill_price, quote):
+    order_result = submit_qmt_order(ContextInfo, "buy", pos["code"], quantity, fill_price, quote)
+    if not order_result:
+        pos["opening_confirmed"] = True
+        return
+    if order_result == "pending":
+        log("ADD_PENDING_NATIVE_CONFIRM", now_text, pos["code"], "qty=", quantity, "note=", "shadow_not_changed_until_native_qty_sync")
         pos["opening_confirmed"] = True
         return
     apply_buy_fill_to_position(ContextInfo, pos, quantity, fill_price, execution_price)
@@ -1700,13 +2567,82 @@ def paper_add_liquidity_pending(ContextInfo, now_text, time_text, fill_price):
         pos["liquidity_pending_quantity"] = pending
         log("LIQUIDITY_ADD_WAIT", now_text, pos["code"], "pending=", pending, "desired=", desired_quantity, "liq_qty=", quote.get("liquidity_qty"))
         return False
-    if not submit_qmt_order(ContextInfo, "buy", pos["code"], quantity, fill_price, quote):
+    order_result = submit_qmt_order(ContextInfo, "buy", pos["code"], quantity, fill_price, quote)
+    if not order_result:
+        return False
+    if order_result == "pending":
+        pos["last_liquidity_add_bar"] = now_text
+        log("LIQUIDITY_ADD_PENDING_NATIVE_CONFIRM", now_text, pos["code"], "qty=", quantity, "note=", "shadow_not_changed_until_native_qty_sync")
         return False
     apply_buy_fill_to_position(ContextInfo, pos, quantity, fill_price, execution_price)
     pos["last_liquidity_add_bar"] = now_text
     pos["liquidity_pending_quantity"] = max(0, target_qty - pos["quantity"])
     log("LIQUIDITY_ADD", now_text, pos["code"], "qty=", quantity, "target=", target_qty, "pending=", pos["liquidity_pending_quantity"], "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "new_qty=", pos["quantity"], "avg=", round(pos["avg_price"], 6), "avg_fill=", round(pos["avg_fill_price"], 6))
     log("ORDER_EXECUTION_SUMMARY", "liquidity_continue_add", "time=", now_text, "code=", pos["code"], "target=", target_qty, "submitted=", quantity, "pending=", pos["liquidity_pending_quantity"], "limit=", execution_price, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "new_shadow_qty=", pos["quantity"], "note=", "compare_with_QMT_deal_panel")
+    return True
+
+
+def apply_sell_fill_to_position(ContextInfo, pos, now_text, quantity, fill_price, execution_price, reason, label):
+    quantity = min(max(safe_int(quantity), 0), pos["quantity"])
+    if quantity <= 0:
+        return False
+    proceeds = quantity * execution_price * pos["multiplier"]
+    fee = quantity * FEE_PER_CONTRACT_PER_SIDE
+    ContextInfo.cash += proceeds - fee
+    pos["quantity"] -= quantity
+    pos["total_sell"] += proceeds
+    pos["total_fees"] += fee
+    log(label, now_text, pos["code"], "qty=", quantity, "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "reason=", reason, "remaining=", pos["quantity"], "cash=", round(ContextInfo.cash, 2))
+    log("ORDER_EXECUTION_SUMMARY", "sell_close", "time=", now_text, "code=", pos["code"], "submitted=", quantity, "remaining=", pos["quantity"], "limit=", execution_price, "reason=", reason, "expected_amount=", round(proceeds, 2), "expected_fee=", round(fee, 2), "note=", "compare_with_QMT_deal_panel")
+    if pos["quantity"] <= 0:
+        pnl = pos["total_sell"] - pos["total_buy"] - pos["total_fees"]
+        ContextInfo.trade_count += 1
+        log("TRADE_CLOSED", now_text, pos["path"], pos["code"], "pnl=", round(pnl, 2), "equity=", round(ContextInfo.cash, 2), "trades=", ContextInfo.trade_count)
+        unregister_owned_position(pos["code"], safe_int(now_text[:8]), quantity, execution_price, now_text, "sell_close_confirmed")
+        ContextInfo.position = None
+    return True
+
+
+def infer_native_close_after_sell_attempt(ContextInfo, pos, now_text, fill_price, reason):
+    if not QMT_INFER_CLOSE_WHEN_NATIVE_POSITION_MISSING_AFTER_SELL:
+        return False
+    submitted_qty = safe_int(pos.get("last_sell_submitted_qty"), 0)
+    submitted_price = safe_float(pos.get("last_sell_submitted_price"))
+    submitted_bar = pos.get("last_sell_submitted_bar")
+    if submitted_qty <= 0 or submitted_price is None or submitted_price <= 0 or not submitted_bar:
+        return False
+    quantity = min(pos["quantity"], submitted_qty)
+    log("NATIVE_CLOSE_INFERRED", now_text, pos["code"], "reason=", "native_position_missing_after_sell_attempt", "submitted_bar=", submitted_bar, "submitted_qty=", submitted_qty, "shadow_qty=", pos["quantity"], "use_price=", submitted_price)
+    return apply_sell_fill_to_position(ContextInfo, pos, now_text, quantity, fill_price, submitted_price, reason, "SELL_INFERRED_NATIVE_CLOSED")
+
+
+def sync_current_position_with_native(ContextInfo, now_text):
+    pos = ContextInfo.position
+    if pos is None:
+        return False
+    native_pos = native_position_snapshot(pos["code"])
+    if native_pos is None:
+        if infer_native_close_after_sell_attempt(ContextInfo, pos, now_text, pos.get("avg_price"), pos.get("last_sell_submitted_reason", "native_position_missing")):
+            return True
+        return False
+    native_qty = safe_int(native_pos.get("qty"), 0)
+    native_avg = safe_float(native_pos.get("avg"))
+    if native_qty <= 0:
+        return False
+    old_qty = safe_int(pos.get("quantity"), 0)
+    if native_qty != old_qty:
+        log("NATIVE_POSITION_SYNC_QTY", "time=", now_text, "code=", pos["code"], "old_qty=", old_qty, "native_qty=", native_qty, "note=", "native_position_authoritative")
+        pos["quantity"] = native_qty
+        pos["initial_quantity"] = max(safe_int(pos.get("initial_quantity"), 0), native_qty)
+        pos["liquidity_pending_quantity"] = max(0, safe_int(pos.get("liquidity_target_quantity"), native_qty) - native_qty)
+    if native_avg is not None and native_avg > 0:
+        old_avg = safe_float(pos.get("avg_fill_price"))
+        if old_avg is None or abs(old_avg - native_avg) > QMT_PRICE_TICK:
+            log("NATIVE_POSITION_SYNC_AVG", "time=", now_text, "code=", pos["code"], "old_avg=", old_avg, "native_avg=", native_avg)
+            pos["avg_fill_price"] = native_avg
+            pos["avg_price"] = native_avg
+            pos["first_price"] = native_avg
+            pos["total_buy"] = native_qty * native_avg * pos["multiplier"]
     return True
 
 
@@ -1717,28 +2653,44 @@ def paper_sell(ContextInfo, now_text, quantity, fill_price, reason):
     quantity = min(max(safe_int(quantity), 0), pos["quantity"])
     if quantity <= 0:
         return
+    sell_attempt_key = "%s_%s_%s" % (now_text, pos["code"], reason)
+    if pos.get("last_sell_attempt_key") == sell_attempt_key:
+        return
+    pos["last_sell_attempt_key"] = sell_attempt_key
+    if QMT_REQUIRE_NATIVE_POSITION_FOR_SELL:
+        native_pos = native_position_snapshot(pos["code"])
+        if native_pos is None:
+            if infer_native_close_after_sell_attempt(ContextInfo, pos, now_text, fill_price, reason):
+                return
+            log("SELL_BLOCKED", "native_position_missing", now_text, pos["code"], reason, "shadow_qty=", pos["quantity"])
+            return
+        native_qty = safe_int(native_pos.get("qty"), 0)
+        if native_qty <= 0:
+            if infer_native_close_after_sell_attempt(ContextInfo, pos, now_text, fill_price, reason):
+                return
+            log("SELL_BLOCKED", "native_position_zero", now_text, pos["code"], reason, "shadow_qty=", pos["quantity"])
+            return
+        if quantity > native_qty:
+            log("SELL_QTY_CAPPED_BY_NATIVE_POSITION", now_text, pos["code"], "shadow_qty=", quantity, "native_qty=", native_qty)
+            quantity = native_qty
     quote = build_order_quote(ContextInfo, "sell", pos["code"], fill_price)
     quote["multiplier"] = pos["multiplier"]
     execution_price = quote.get("order_price")
     if execution_price is None or execution_price <= 0:
         log("SELL_ABORTED_BAD_PRICE", now_text, pos["code"], reason)
         return
-    if not submit_qmt_order(ContextInfo, "sell", pos["code"], quantity, fill_price, quote):
+    pos["last_sell_submitted_bar"] = now_text
+    pos["last_sell_submitted_qty"] = quantity
+    pos["last_sell_submitted_price"] = execution_price
+    pos["last_sell_submitted_reason"] = reason
+    order_result = submit_qmt_order(ContextInfo, "sell", pos["code"], quantity, fill_price, quote)
+    if not order_result:
         log("SELL_ABORTED_ORDER_NOT_SENT", now_text, pos["code"], reason)
         return
-    proceeds = quantity * execution_price * pos["multiplier"]
-    fee = quantity * FEE_PER_CONTRACT_PER_SIDE
-    ContextInfo.cash += proceeds - fee
-    pos["quantity"] -= quantity
-    pos["total_sell"] += proceeds
-    pos["total_fees"] += fee
-    log("SELL", now_text, pos["code"], "qty=", quantity, "price=", round(fill_price, 6), "fill=", round(execution_price, 6), "reason=", reason, "remaining=", pos["quantity"], "cash=", round(ContextInfo.cash, 2))
-    log("ORDER_EXECUTION_SUMMARY", "sell_close", "time=", now_text, "code=", pos["code"], "submitted=", quantity, "remaining=", pos["quantity"], "limit=", execution_price, "reason=", reason, "expected_avg=", round(quote.get("liquidity_avg"), 6) if quote.get("liquidity_avg") is not None else None, "expected_worst=", quote.get("liquidity_worst"), "liq_qty=", quote.get("liquidity_qty"), "expected_amount=", round(proceeds, 2), "expected_fee=", round(fee, 2), "note=", "compare_with_QMT_deal_panel")
-    if pos["quantity"] <= 0:
-        pnl = pos["total_sell"] - pos["total_buy"] - pos["total_fees"]
-        ContextInfo.trade_count += 1
-        log("TRADE_CLOSED", now_text, pos["path"], pos["code"], "pnl=", round(pnl, 2), "equity=", round(ContextInfo.cash, 2), "trades=", ContextInfo.trade_count)
-        ContextInfo.position = None
+    if order_result == "pending":
+        log("SELL_PENDING_NATIVE_CONFIRM", now_text, pos["code"], "qty=", quantity, "reason=", reason, "note=", "shadow_not_changed_until_native_position_sync")
+        return
+    apply_sell_fill_to_position(ContextInfo, pos, now_text, quantity, fill_price, execution_price, reason, "SELL")
 
 
 def minutes_since_entry(pos, now_text):
@@ -2268,15 +3220,20 @@ def update_daily_from_minute(ContextInfo, current_date):
 
 
 def init(ContextInfo):
-    global RUNTIME_ORDER_KEYS, RUNTIME_MINUTE_ORDER_KEYS, RUNTIME_OPEN_LOCK_DATES, RUNTIME_SIGNAL_LOG_KEYS
+    global RUNTIME_ORDER_KEYS, RUNTIME_MINUTE_ORDER_KEYS, RUNTIME_OPEN_LOCK_DATES, RUNTIME_SIGNAL_LOG_KEYS, RUNTIME_NATIVE_PATH_BY_CODE, RUNTIME_NATIVE_DIRECTION_BY_CODE, RUNTIME_OWNED_REGISTRY_KEYS, RUNTIME_LAST_BAR_TEXT
     RUNTIME_ORDER_KEYS = set()
     RUNTIME_MINUTE_ORDER_KEYS = set()
     RUNTIME_OPEN_LOCK_DATES = set()
     RUNTIME_SIGNAL_LOG_KEYS = set()
+    RUNTIME_NATIVE_PATH_BY_CODE = {}
+    RUNTIME_NATIVE_DIRECTION_BY_CODE = {}
+    RUNTIME_OWNED_REGISTRY_KEYS = set()
+    RUNTIME_LAST_BAR_TEXT = ""
     ContextInfo.live_account_id = QMT_ACCOUNT_ID
     ContextInfo.set_universe(UNDERLYINGS)
     ContextInfo.cash = INITIAL_CASH
     ContextInfo.position = None
+    ContextInfo.pending_open = None
     ContextInfo.trade_count = 0
     ContextInfo.day_entries = 0
     ContextInfo.day_locked = False
@@ -2297,19 +3254,21 @@ def init(ContextInfo):
     log("LIVE_DATE_GATE", "enabled=", LIVE_WALL_CLOCK_GATE, "target_date=", live_trade_date(), "override=", LIVE_TRADE_DATE_OVERRIDE)
     log("BBO", "use_full_tick=", QMT_USE_FULL_TICK_BBO, "require_last_bar=", QMT_BBO_REQUIRE_LAST_BAR)
     log("RISK", "initial_cash=", INITIAL_CASH, "premium_cap=", ABS_PREMIUM_CAP, "max_trades_day=", LIVE_MAX_TRADES_PER_DAY)
+    load_owned_position_registry(live_trade_date())
     log_live_account_status(ContextInfo, "init")
 
 
 def handlebar(ContextInfo):
-    global RUNTIME_SIGNAL_LOG_KEYS
+    global RUNTIME_SIGNAL_LOG_KEYS, RUNTIME_NATIVE_PATH_BY_CODE, RUNTIME_NATIVE_DIRECTION_BY_CODE, RUNTIME_LAST_BAR_TEXT
     now_text, current_date, time_text = current_datetime(ContextInfo)
     if current_date <= 0 or len(time_text) != 4:
         return
     if not live_date_gate_allows(ContextInfo, now_text, current_date):
         return
-    if now_text == ContextInfo.state.get("last_bar_text", ""):
+    if now_text == ContextInfo.state.get("last_bar_text", "") or now_text == RUNTIME_LAST_BAR_TEXT:
         return
     ContextInfo.state["last_bar_text"] = now_text
+    RUNTIME_LAST_BAR_TEXT = now_text
     ContextInfo.state["time"] = time_text
     if not getattr(ContextInfo, "live_account_status_logged", False):
         ContextInfo.live_account_status_logged = True
@@ -2321,9 +3280,13 @@ def handlebar(ContextInfo):
         ContextInfo.day_entries = 0
         ContextInfo.day_locked = False
         ContextInfo.position = None
+        ContextInfo.pending_open = None
+        RUNTIME_NATIVE_PATH_BY_CODE = {}
+        RUNTIME_NATIVE_DIRECTION_BY_CODE = {}
         ContextInfo.state["bars"] = {}
         ContextInfo.state["universe"] = []
         ContextInfo.daily_info = daily_metrics(ContextInfo.daily_rows, current_date)
+        load_owned_position_registry(current_date)
         log("NEW_DAY", current_date, "daily_ready=", ContextInfo.daily_info.get("ready"), "direction=", ContextInfo.daily_info.get("direction"), "ma20=", round(ContextInfo.daily_info.get("ma20"), 6) if ContextInfo.daily_info.get("ma20") is not None else None)
     etf_bar = read_bar(ContextInfo, KCB_CODE)
     if etf_bar is None:
@@ -2331,7 +3294,7 @@ def handlebar(ContextInfo):
         return
     append_bar(ContextInfo.state["bars"], KCB_CODE, now_text, time_text, etf_bar)
     ContextInfo.state["last_etf_close"] = etf_bar["close"]
-    if time_text == "0930":
+    if time_text >= "0930" and not ContextInfo.state.get("universe", []):
         ContextInfo.state["universe"] = build_universe(ContextInfo, current_date, etf_bar["close"])
     for item in ContextInfo.state.get("universe", []):
         if item["dte"] < DTE_MIN or item["dte"] > DTE_MAX:
@@ -2339,6 +3302,12 @@ def handlebar(ContextInfo):
         opt_bar = read_bar(ContextInfo, item["code"])
         if opt_bar is not None:
             append_bar(ContextInfo.state["bars"], item["code"], now_text, time_text, opt_bar)
+    if ContextInfo.position is None:
+        reconcile_pending_open(ContextInfo, now_text)
+    if ContextInfo.position is None:
+        recover_native_position_if_any(ContextInfo, now_text, current_date, time_text)
+    if ContextInfo.position is not None:
+        sync_current_position_with_native(ContextInfo, now_text)
     heartbeat_key = "heartbeat_%s_%s" % (str(current_date), time_text)
     if time_text in HEARTBEAT_MINUTES and heartbeat_key not in RUNTIME_SIGNAL_LOG_KEYS:
         RUNTIME_SIGNAL_LOG_KEYS.add(heartbeat_key)

@@ -14,6 +14,15 @@ from __future__ import print_function
 import datetime
 import math
 
+try:
+    from qmt_local_config import (
+        QMT_ACCOUNT_ID as LOCAL_QMT_ACCOUNT_ID,
+        QMT_NATIVE_ORDER_ENABLED as LOCAL_QMT_NATIVE_ORDER_ENABLED,
+    )
+except Exception:
+    LOCAL_QMT_ACCOUNT_ID = ""
+    LOCAL_QMT_NATIVE_ORDER_ENABLED = False
+
 
 # ---------------------------------------------------------------------------
 # User configuration
@@ -33,8 +42,8 @@ CONTRACT_MULTIPLIER_DEFAULT = 10000
 
 # Native QMT simulated-account orders. Keep disabled until the parity
 # backtest passes and the broker confirms these option passorder parameters.
-QMT_NATIVE_ORDER_ENABLED = True
-QMT_ACCOUNT_ID = "210400032829"
+QMT_NATIVE_ORDER_ENABLED = LOCAL_QMT_NATIVE_ORDER_ENABLED
+QMT_ACCOUNT_ID = LOCAL_QMT_ACCOUNT_ID
 QMT_OPTION_ACCOUNT_TYPE = 1101
 QMT_BUY_OPEN_OP = 50
 QMT_SELL_CLOSE_OP = 51

@@ -17,12 +17,13 @@
 - 覆盖范围：`2023-06-06` 到 `2026-05-25`。本地 ETF sqlite 缺 `2023-06-05`，所以主表从 `2023-06-06` 开始。
 - 期权 OHLCV：AkShare `option_sse_daily_sina`。
 - IV/Greeks：AkShare `option_risk_indicator_sse`，字段 `implied_volatility` 为交易所口径隐含波动率。
-- ETF 日线：从 `/Users/aaren/ChinaETF/china-etf-strategy/cache/etf_5m_2020_202605.sqlite` 的 5 分钟数据聚合。
+- ETF 日线：从 `OPTION_ETF_SQLITE_PATH` 指向的 ETF 5 分钟 SQLite 数据聚合。
 - ETF 历史波动率：ETF 日收盘收益率滚动标准差乘以 `sqrt(252)`，提供 `hv_20d`、`hv_30d`、`hv_60d`、`hv_120d`。
 
 ## 重新生成
 
 ```bash
+export OPTION_ETF_SQLITE_PATH="/absolute/path/to/etf_5m_2020_202605.sqlite"
 PYTHONPATH=.deps python3 scripts/build_kcb_option_daily.py
 ```
 

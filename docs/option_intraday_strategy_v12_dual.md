@@ -480,6 +480,48 @@ PYTHONPATH=.deps python3 scripts/backtest_v11_opening_plus_strong15m.py \
 - `research/backtest_kcb_strict_dte_long_exhaustion_main_trades.csv`
 - `research/backtest_kcb_strict_dte_long_exhaustion_main_capital.csv`
 
+## 科创 09:45 Put 反转增强模块：保守版
+
+该模块不是替代 `753.37%` 科创-only 主策略，而是作为独立增强路径叠加在主策略之后。它专门寻找一种结构：科创 50 ETF 早盘快速上冲，但近 ATM Put 在 `09:45` 仍有足够成交和合适 Delta，可能对应“早盘冲高后回落”的日内反转机会。
+
+正式保守口径暂定为：
+
+- 触发时间：只看 `09:45` 已完成的 15 分钟窗口。
+- 标的：仅科创 50 ETF，`588000`。
+- 方向：仅 Put。
+- ETF 条件：`09:45` 时 ETF 相对当日开盘涨幅 `>=0.50%`。
+- 合约 Delta：`abs(delta)` 在 `0.45–0.60`。
+- 期权价格：`09:45` 期权价格 `>=0.03`。
+- 期权成交量：该 15 分钟窗口成交量 `>=1000` 张。
+- 同日冲突处理：若主策略当天已经有交易，则跳过该增强信号。
+- 仓位：目标权利金仓位 `20%`。
+- 滑点假设：买入价加 `0.0003`，卖出价减 `0.0003`。
+- 流动性约束：计划买入张数不得超过该合约 `09:45` 这根 15 分钟成交量的 `5%`；超过则跳过。
+- 退出：沿用现有日内退出模型，作为 `normal_put_reversal_0945` 信号处理。
+
+保守版验证结果：
+
+| 口径 | 期末资金 | 总收益率 | 交易数 | 净胜率 | 最大回撤 | 增强交易 | 容量跳过 | 最大成交量占比 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 主策略基准 | 853,372.52 元 | 753.37% | 22 | 86.36% | 8.06% | 0 | 0 | - |
+| 主策略 + Put反转增强保守版 | 1,301,625.36 元 | 1201.63% | 76 | 69.74% | 9.85% | 54 | 6 | 4.94% |
+
+对比敏感性结论：
+
+- `18%` 仓位更稳，`0.0003` 滑点下最大回撤约 `9.52%`，但收益低于 20%。
+- `20%` 仓位在严格 `5%` 成交量占比限制下，完整重算资金曲线后仍将最大回撤压在 `10%` 以内，是当前保守增强版的推荐参数。
+- `22%` 和 `25%` 仓位收益更高，但最大回撤开始超过 `10%`，不作为保守版。
+- `50%` 仓位虽然回测收益很高，但对成交量占比和回撤都过于激进，不作为可执行策略。
+- 该增强模块盈利集中度偏高，前几笔大盈利对结果贡献很大。因此它只能作为增强模块继续样本外观察，不能单独升级为主策略。
+
+对应结果文件：
+
+- `research/put_reversal_0945_position_slippage_capacity_compare.csv`
+- `research/put_reversal_0945_conservative20_cap5_etfup0.005_delta0.45_0.6_pos0.2_normal_rankvolume15_minp0.03_minv1000_slip0.0003_capshare0.05_combined_summary.csv`
+- `research/put_reversal_0945_conservative20_cap5_etfup0.005_delta0.45_0.6_pos0.2_normal_rankvolume15_minp0.03_minv1000_slip0.0003_capshare0.05_combined_trades.csv`
+- `research/put_reversal_0945_conservative20_cap5_etfup0.005_delta0.45_0.6_pos0.2_normal_rankvolume15_minp0.03_minv1000_slip0.0003_capshare0.05_combined_capital.csv`
+- `scripts/backtest_kcb_put_reversal_0945.py`
+
 ## 数据问题与限制
 
 - `2025-07-04` 至 `2026-05-25` 的 ETF 1 分钟数据完整，没有缺失交易日。

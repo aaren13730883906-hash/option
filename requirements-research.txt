@@ -1,0 +1,7 @@
+# Research and backtest environment. QMT's embedded Python runtime is separate.
+numpy
+pandas
+requests
+openpyxl
+matplotlib
+akshare

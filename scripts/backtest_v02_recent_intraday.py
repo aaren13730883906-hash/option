@@ -33,7 +33,12 @@ DAILY_CSV = DATA_DIR / "kcb_option_daily.csv"
 MARKET_IV_CSV = DATA_DIR / "kcb_market_iv_daily.csv"
 ETF_DAILY_CSV = DATA_DIR / "etf_daily_588000_588080.csv"
 TOKEN_RTF = ROOT / "data:ifind_refresh_token" / "refresh- token.rtf"
-DEFAULT_SQLITE = Path("/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite")
+DEFAULT_SQLITE = Path(
+    os.environ.get(
+        "OPTION_ETF_SQLITE_PATH",
+        "/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite",
+    )
+)
 
 GET_ACCESS_TOKEN_URL = "https://quantapi.51ifind.com/api/v1/get_access_token"
 HIGH_FREQUENCY_URL = "https://quantapi.51ifind.com/api/v1/high_frequency"

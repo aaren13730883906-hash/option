@@ -9,6 +9,7 @@ pre-screened signal dates are requested, keeping API usage small.
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 import sys
 from io import BytesIO
@@ -32,7 +33,12 @@ DAILY_OUTPUT = DATA_DIR / "cyb_option_signal_daily.csv"
 RISK_OUTPUT = DATA_DIR / "cyb_option_risk_signal_dates.csv"
 ETF_OUTPUT = DATA_DIR / "etf_daily_159915.csv"
 IV_OUTPUT = DATA_DIR / "cyb_market_iv_daily.csv"
-SQLITE_PATH = Path("/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite")
+SQLITE_PATH = Path(
+    os.environ.get(
+        "OPTION_ETF_SQLITE_PATH",
+        "/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite",
+    )
+)
 SZSE_REPORT_URL = "https://www.sse.org.cn/api/report/ShowReport"
 IFIND_HISTORY_URL = "https://quantapi.51ifind.com/api/v1/cmd_history_quotation"
 
