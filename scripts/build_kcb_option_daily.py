@@ -29,7 +29,7 @@ OPTION_DAILY_DIR = CACHE_DIR / "option_daily_sina"
 DEFAULT_SQLITE = Path(
     os.environ.get(
         "OPTION_ETF_SQLITE_PATH",
-        "/Users/aaren/ChinaETF/china-etf-strategy/cache/etf_5m_2020_202605.sqlite",
+        "/Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite",
     )
 )
 UNDERLYINGS = {

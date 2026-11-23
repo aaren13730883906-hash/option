@@ -20,8 +20,8 @@
 - 项目目录：`/Users/aaren/策略/期权策略`
 - Git 分支：`main`
 - GitHub origin：`https://github.com/aaren13730883906-hash/option.git`
-- 当前已知基线提交：`f4f7567 Add QMT passorder variant probe`
-- 旧电脑当前工作区存在未提交修改和未跟踪文件。新电脑不能假设 GitHub 已包含旧电脑最新状态。
+- 当前迁移提交：`085f872 Prepare option research project migration`
+- 当前工作区已干净，GitHub `origin/main` 已包含该迁移提交。
 - 当前没有唯一的正式 QMT 入口。根据本地最新修改，暂把
   `qmt/qmt_kcb_1032_live_sim.py` 的 `R20` 作为迁移主候选，把
   `qmt/qmt_v12_dual_live_sim.py` 的 `R19` 作为备用和对照版本。新电脑在任何下单
@@ -37,8 +37,8 @@ git status --short --branch
 python3 scripts/migration_inventory.py --output migration_inventory_new.json
 ```
 
-如果 GitHub 尚未包含旧电脑的新提交，先使用旧电脑交接的代码包或等待旧电脑完成
-人工审查后的提交。不要自行把所有未跟踪文件加入 Git。
+新电脑应先确认 `origin/main` 包含 `085f872` 或更晚的迁移提交。不要自行把
+`data/`、`research/`、凭证或运行状态加入 Git。
 
 ## 旧电脑已完成的准备
 
@@ -173,10 +173,9 @@ export IFIND_REFRESH_TOKEN="..."
 
 ## 外部数据路径
 
-项目历史上使用过以下旧电脑路径：
+旧电脑当前使用的外部路径是：
 
 ```text
-/Users/aaren/ChinaETF/china-etf-strategy/cache/etf_5m_2020_202605.sqlite
 /Users/aaren/策略/china-etf-strategy/cache/etf_5m_2020_202605.sqlite
 /Users/aaren/策略/A股数据/基金_分钟数据/ETF_分钟数据/1分钟_按月归档
 ```

@@ -5,17 +5,18 @@ live simulated trading.
 
 ## Before enabling
 
-1. Fill `QMT_ACCOUNT_ID` locally with the simulated option account ID.
-2. Keep `QMT_NATIVE_ORDER_ENABLED = True`.
-3. Keep `HISTORICAL_PARITY_MODE = False`.
-4. Keep `EXECUTION_SMOKE_TEST = False`.
-5. Keep `FORCE_TEST_DIRECTION = ""`.
-6. QMT strategy type: `OPTION`.
-7. Account type: stock option account.
-8. Main chart: `588000.SH` (or `588000` if the UI accepts digits only).
-9. Period: 1 minute.
+1. Copy `qmt_local_config.example.py` to `qmt_local_config.py` in the QMT strategy directory.
+2. Fill `QMT_ACCOUNT_ID` locally with the simulated option account ID.
+3. Keep `QMT_NATIVE_ORDER_ENABLED = False` until the no-order probes and shadow simulation pass.
+4. Keep `HISTORICAL_PARITY_MODE = False`.
+5. Keep `EXECUTION_SMOKE_TEST = False`.
+6. Keep `FORCE_TEST_DIRECTION = ""`.
+7. QMT strategy type: `OPTION`.
+8. Account type: stock option account.
+9. Main chart: `588000.SH` (or `588000` if the UI accepts digits only).
+10. Period: 1 minute.
 
-For the first session, keep:
+After the validation steps, a first simulated-order session can use:
 
 - `LIVE_MAX_CONTRACTS = 1`
 - `LIVE_MAX_TRADES_PER_DAY = 1`
@@ -25,10 +26,10 @@ For the first session, keep:
 The startup log must contain:
 
 ```text
-[V12_PAPER] BUILD_ID V12_LIVE_SIM_20260703_R12
+[V12_PAPER] BUILD_ID V12_LIVE_SIM_20260703_R19
 [V12_PAPER] LIVE_PREFLIGHT ready= True
 [V12_PAPER] MODE QMT_NATIVE_SIM
-[V12_PAPER] PAPER_START_DATE 20260703
+[V12_PAPER] PAPER_START_DATE <selected_test_date>
 ```
 
 If it contains `LIVE_FAIL_CLOSED`, the strategy remains observable but will
